@@ -124,6 +124,7 @@ flex-direction: column;
 }
 
 .settings-section-title {
+	display: none;
 	font-size: 1.1rem;
 	font-weight: 600;
 	margin-bottom: 12px;
@@ -214,7 +215,7 @@ flex-direction: column;
 /* Theme selector styles */
 /* 主题选择器样式 */
 .theme-selector {
-	display: flex;
+	display: none;
 	gap: 12px;
 	overflow-x: auto;
 	padding: 8px 4px;
@@ -500,7 +501,7 @@ flex-direction: column;
 .main::before {	content: "";
 	position: absolute;
 	inset: 0;
-	background: url(../assets/wallpaper-1.webp) left top / auto 100% repeat-x;
+	/* background: url(../assets/wallpaper-1.webp) left top / auto 100% repeat-x; */
 	opacity: 0.15;
 	mix-blend-mode: multiply;
 	pointer-events: none;
