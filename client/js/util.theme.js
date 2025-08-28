@@ -75,7 +75,7 @@ export function applyTheme(themeId) {
 		
 		// Apply new background
 		if (theme.background.startsWith('url(')) {
-			mainElement.style.backgroundImage = theme.background;
+			// mainElement.style.backgroundImage = theme.background;
 			mainElement.style.backgroundSize = '100% 100%';
 			mainElement.style.backgroundRepeat = 'no-repeat';
 			mainElement.style.backgroundPosition = 'center';
