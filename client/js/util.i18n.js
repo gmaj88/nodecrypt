@@ -260,7 +260,7 @@ const LANGUAGES = {
 			'help.tip_security_reminder_desc': '频道名和密码都需要完全一致才能进入同一个房间',
 			'help.tip_password_strategy': '密码策略',
 			'help.tip_password_strategy_desc': '建议使用包含字母、数字和符号的强密码',
-			'index.footer_info':'无数据库架构，实现端到端加密通信',
+			'index.footer_info':'无数据库架构，实现端到端加密通信，保护隐私信息',
 		}
 	}
 };
