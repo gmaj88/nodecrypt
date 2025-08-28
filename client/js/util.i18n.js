@@ -1,5 +1,5 @@
-// Simple i18n utility for NodeCrypt
-// NodeCrypt 简单国际化工具
+// Simple i18n utility for EncrypteChannel
+// EncrypteChannel 简单国际化工具
 
 // Language definitions
 // 语言定义
@@ -10,12 +10,12 @@ const LANGUAGES = {
 		flag: '🇺🇸',
 		translations: {
 			// Meta tags for SEO
-			'meta.description': 'NodeCrypt - True end-to-end encrypted chat system, no database, all messages encrypted locally, server only relays encrypted data, supports Cloudflare Workers, Docker, self-hosting and local development.',
-			'meta.keywords': 'end-to-end encryption, security, chat, WebSocket, Cloudflare Workers, JavaScript, E2EE, anonymous communication, AES, ECDH, RSA, ChaCha20, security, open source, NodeCrypt, shuaiplus',
-			'meta.og_title': 'NodeCrypt - End-to-End Encrypted Chat System',
-			'meta.og_description': 'NodeCrypt is a zero-knowledge, end-to-end encrypted open source chat system where all encryption and decryption is done locally on the client side, and servers cannot access plaintext. Supports multi-platform deployment, secure, anonymous, no message history.',
-			'meta.twitter_title': 'NodeCrypt - End-to-End Encrypted Chat System',
-			'meta.twitter_description': 'NodeCrypt is a zero-knowledge, end-to-end encrypted open source chat system where all encryption and decryption is done locally on the client side, and servers cannot access plaintext.',
+			'meta.description': 'EncrypteChannel - True end-to-end encrypted chat system, no database, all messages encrypted locally, server only relays encrypted data, supports Cloudflare Workers, Docker, self-hosting and local development.',
+			'meta.keywords': 'end-to-end encryption, security, chat, WebSocket, Cloudflare Workers, JavaScript, E2EE, anonymous communication, AES, ECDH, RSA, ChaCha20, security, open source, EncrypteChannel',
+			'meta.og_title': 'EncrypteChannel - End-to-End Encrypted Chat System',
+			'meta.og_description': 'EncrypteChannel is a zero-knowledge, end-to-end encrypted open source chat system where all encryption and decryption is done locally on the client side, and servers cannot access plaintext. Supports multi-platform deployment, secure, anonymous, no message history.',
+			'meta.twitter_title': 'EncrypteChannel - End-to-End Encrypted Chat System',
+			'meta.twitter_description': 'EncrypteChannel is a zero-knowledge, end-to-end encrypted open source chat system where all encryption and decryption is done locally on the client side, and servers cannot access plaintext.',
 			
 			// Login and main UI
 			'ui.enter_node': 'Enter a Node',
@@ -96,7 +96,8 @@ const LANGUAGES = {
 			'help.title': 'User Guide',
 			'help.back_to_login': 'Back to Login',
 			'help.usage_guide': 'User Guide',
-			'help.what_is_nodecrypt': '🔐 What is NodeCrypt?',			'help.what_is_nodecrypt_desc': 'NodeCrypt is a true zero-knowledge end-to-end encrypted chat system. With a database-free architecture, all messages are encrypted locally on your device, and the server serves only as an encrypted data relay station, unable to access any of your plaintext content.',
+			'help.what_is_EncrypteChannel': '🔐 What is EncrypteChannel?',
+			'help.what_is_EncrypteChannel_desc': 'EncrypteChannel is a true zero-knowledge end-to-end encrypted chat system. With a database-free architecture, all messages are encrypted locally on your device, and the server serves only as an encrypted data relay station, unable to access any of your plaintext content.',
 			'help.how_to_start': '🚀 Quick Start',
 			'help.step_username': 'Enter Username',
 			'help.step_username_desc': 'Choose a display name for the room, can be any name you like',
@@ -106,7 +107,10 @@ const LANGUAGES = {
 			'help.step_password_desc': 'Used to distinguish different rooms while participating in encryption process to enhance security',
 			'help.step_join': 'Click "Join Room"',
 			'help.step_join_desc': 'System will automatically generate encryption keys and start secure chatting',
-			'help.security_features': '🔑 Security Features',			'help.e2e_encryption': '🛡️ End-to-End Encryption',
+			'help.step_share': 'Share the Room link',
+			'help.step_share_desc': 'After entering the room, click on the three dots in the upper right corner, click on the "Share" button that appears, and copy the link address to a friend',
+			'help.security_features': '🔑 Security Features',			
+			'help.e2e_encryption': '🛡️ End-to-End Encryption',
 			'help.e2e_encryption_desc': 'Uses AES-256 + ECDH encryption algorithm, messages can only be decrypted by you and the recipient',
 			'help.password_enhanced_encryption': '🔐 Password Enhanced Encryption',
 			'help.password_enhanced_encryption_desc': 'Node password directly participates in encryption key generation, providing additional security protection layer',
@@ -126,6 +130,7 @@ const LANGUAGES = {
 			'help.tip_security_reminder_desc': 'Both node name and password must be exactly the same to enter the same room',
 			'help.tip_password_strategy': 'Password Strategy',
 			'help.tip_password_strategy_desc': 'Recommend using strong passwords containing letters, numbers and symbols',
+			'index.footer_info':'No database architecture, achieving end-to-end encrypted communication',
 		}
 	},
 	zh: {
@@ -134,22 +139,22 @@ const LANGUAGES = {
 		flag: '🇨🇳',
 		translations: {
 			// Meta tags for SEO
-			'meta.description': 'NodeCrypt - 真正的端到端加密聊天系统，无数据库，所有消息本地加密，服务器仅做加密数据中转，支持 Cloudflare Workers、Docker、自托管和本地开发。',
-			'meta.keywords': '端到端加密, 安全, 聊天, WebSocket, Cloudflare Workers, JavaScript, E2EE, 匿名通信, AES, ECDH, RSA, ChaCha20, 安全, 开源, NodeCrypt, shuaiplus',
-			'meta.og_title': 'NodeCrypt - 端到端加密聊天系统',
-			'meta.og_description': 'NodeCrypt 是一个端到端加密的开源聊天系统，所有加密解密均在客户端本地完成，服务器无法获取明文。支持多平台部署，安全、匿名、无历史消息。',
-			'meta.twitter_title': 'NodeCrypt - 端到端加密聊天系统',
-			'meta.twitter_description': 'NodeCrypt 是一个端到端加密的开源聊天系统，所有加密解密均在客户端本地完成，服务器无法获取明文。',
+			'meta.description': 'EncrypteChannel - 真正的端到端加密聊天系统，无数据库，所有消息本地加密，服务器仅做加密数据中转，支持 Cloudflare Workers、Docker、自托管和本地开发。',
+			'meta.keywords': '端到端加密, 安全, 聊天, WebSocket, Cloudflare Workers, JavaScript, E2EE, 匿名通信, AES, ECDH, RSA, ChaCha20, 安全, 开源, EncrypteChannel',
+			'meta.og_title': 'EncrypteChannel - 端到端加密聊天系统',
+			'meta.og_description': 'EncrypteChannel 是一个端到端加密的开源聊天系统，所有加密解密均在客户端本地完成，服务器无法获取明文。支持多平台部署，安全、匿名、无历史消息。',
+			'meta.twitter_title': 'EncrypteChannel - 端到端加密聊天系统',
+			'meta.twitter_description': 'EncrypteChannel 是一个端到端加密的开源聊天系统，所有加密解密均在客户端本地完成，服务器无法获取明文。',
 			
 			// Login and main UI
-			'ui.enter_node': '进入新的节点',
+			'ui.enter_node': '创建新的频道',
 			'ui.username': '用户名',
-			'ui.node_name': '节点名称',
-			'ui.node_password': '节点密码',
+			'ui.node_name': '频道名称',
+			'ui.node_password': '频道密码',
 			'ui.optional': '（可选）',
 			'ui.enter': '确定',
 			'ui.connecting': '连接中...',
-			'ui.node_exists': '此节点已存在',
+			'ui.node_exists': '此频道已存在',
 			'ui.my_name': '我的名字',
 			'ui.members': '在线成员',
 			'ui.message': '消息',
@@ -221,21 +226,24 @@ const LANGUAGES = {
 			'help.title': '使用说明',
 			'help.back_to_login': '返回登录',
 			'help.usage_guide': '使用说明',
-			'help.what_is_nodecrypt': '🔐 什么是 NodeCrypt？',			'help.what_is_nodecrypt_desc': 'NodeCrypt 是一个真正的端到端加密聊天系统。采用无数据库架构，所有消息在您的设备上本地加密，服务器仅作为加密数据的中转站，无法获取您的任何明文内容。',
+			'help.what_is_EncrypteChannel': '🔐 系统介绍？',			
+			'help.what_is_EncrypteChannel_desc': '一个真正的端到端加密聊天系统。采用无数据库架构，所有消息在您的设备上本地加密，服务器仅作为加密数据的中转站，无法获取您的任何明文内容。',
 			'help.how_to_start': '🚀 快速开始',
 			'help.step_username': '输入用户名',
 			'help.step_username_desc': '选择一个在房间中显示的昵称，可以是任何您喜欢的名称',
-			'help.step_node_name': '设置节点名',
+			'help.step_node_name': '设置频道名',
 			'help.step_node_name_desc': '房间的唯一标识符，相当于房间号',
-			'help.step_password': '设置节点密码',
+			'help.step_password': '设置频道密码',
 			'help.step_password_desc': '用于区分不同房间，同时参与加密过程，提升安全性',
 			'help.step_join': '点击"加入房间"',
 			'help.step_join_desc': '系统将自动生成加密密钥，开始安全聊天',
+			'help.step_share': '分享"房间"链接',
+			'help.step_share_desc': '进入房间后，点击右上角的三个点，点击出现的"分享"按钮，复制链接地址给朋友',
 			'help.security_features': '🔑 安全特性',
 			'help.e2e_encryption': '🛡️ 端到端加密',
 			'help.e2e_encryption_desc': '使用 AES-256 + ECDH 加密算法，消息仅您和接收者可解密',
 			'help.password_enhanced_encryption': '🔐 密码增强加密',
-			'help.password_enhanced_encryption_desc': '节点密码直接参与加密密钥生成，提供额外的安全保护层',
+			'help.password_enhanced_encryption_desc': '频道密码直接参与加密密钥生成，提供额外的安全保护层',
 			'help.no_history': '🚫 零历史记录',
 			'help.no_history_desc': '所有消息仅存在于当前会话，离线用户无法获取历史消息',
 			'help.anonymous_communication': '🎭 完全匿名',
@@ -243,15 +251,16 @@ const LANGUAGES = {
 			'help.decentralized': '🌐 去中心化',
 			'help.decentralized_desc': '支持自托管部署，服务器不参与加密解密过程',			'help.usage_tips': '💡 使用技巧',
 			'help.important_note': '⚠️ 重要提示',
-			'help.room_isolation_note': '相同节点名但不同密码的是两个完全独立的房间，无法相互通信。',
+			'help.room_isolation_note': '相同频道名但不同密码的是两个完全独立的房间，无法相互通信。',
 			'help.tip_private_chat': '私人对话',
-			'help.tip_private_chat_desc': '使用复杂的节点名和密码，只分享给特定人员',
+			'help.tip_private_chat_desc': '使用复杂的频道名和密码，只分享给特定人员',
 			'help.tip_group_chat': '群聊',
-			'help.tip_group_chat_desc': '使用简单易记的节点名和密码，方便多人加入',
+			'help.tip_group_chat_desc': '使用简单易记的频道名和密码，方便多人加入',
 			'help.tip_security_reminder': '安全提醒',
-			'help.tip_security_reminder_desc': '节点名和密码都需要完全一致才能进入同一个房间',
+			'help.tip_security_reminder_desc': '频道名和密码都需要完全一致才能进入同一个房间',
 			'help.tip_password_strategy': '密码策略',
 			'help.tip_password_strategy_desc': '建议使用包含字母、数字和符号的强密码',
+			'index.footer_info':'无数据库架构，实现端到端加密通信',
 		}
 	}
 };
