@@ -1870,8 +1870,9 @@ flex-direction: column;
 	display: flex;
 	align-items: center;
 	justify-content: center;
-	border-radius: 50%;
+	border-radius: 50px;
 	margin: 0 4px;
+	padding: 0.7em 0.7em;
 	flex-shrink: 0;
 	transition: background-color 0.2s ease, transform 0.2s ease;
 }
@@ -1944,8 +1945,8 @@ flex-direction: column;
 }
 
 .voice-call-btn {
-	width: 36px;
-	height: 36px;
+	width: 3.5em;
+	height: 3.5em;
 	border: none;
 	border-radius: 50%;
 	cursor: pointer;
