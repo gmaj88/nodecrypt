@@ -1,0 +1,8 @@
+/* 添加一个预加载样式，避免闪烁 */
+.preload * {
+	-webkit-transition: none !important;
+	-moz-transition: none !important;
+	-ms-transition: none !important;
+	-o-transition: none !important;
+	transition: none !important;
+}
