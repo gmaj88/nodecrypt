@@ -239,8 +239,8 @@
 /* Mobile voice chat styles */
 /* 移动端语音聊天样式 */
 .chat-voice-btn {
-	width: 32px;
-	height: 32px;
+	width: 3.5em;
+	height: 3.5em;
 	margin: 0 2px;
 }
 
@@ -254,13 +254,13 @@
 }
 
 .voice-call-btn {
-	width: 32px;
-	height: 32px;
+	width: 3.5em;
+	height: 3.5em;
 }
 
 .voice-call-btn svg {
-	width: 16px;
-	height: 16px;
+	width: 3em;
+	height: 3em;
 }
 
 .voice-call-text {

@@ -1862,8 +1862,8 @@ flex-direction: column;
 /* ===== Voice Chat Styles ===== */
 
 .chat-voice-btn {
-	width: 36px;
-	height: 36px;
+	width: 3.5em;
+	height: 3.5em;
 	border: none;
 	background: none;
 	cursor: pointer;
