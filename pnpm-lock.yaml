@@ -52,7 +52,7 @@ importers:
         specifier: ^6.3.5
         version: 6.3.5(terser@5.43.1)
       wrangler:
-        specifier: ^4.16.1
+        specifier: ^4.33.0
         version: 4.33.0
 
 packages:
