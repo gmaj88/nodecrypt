@@ -516,7 +516,7 @@ flex-direction: column;
 	justify-content: space-between;
 	min-height: 30px;
 	position: relative;
-	z-index: 3;
+	z-index: 50;
 }
 
 .main-header .group-title {
