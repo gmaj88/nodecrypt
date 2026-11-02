@@ -566,10 +566,33 @@ export function autofillRoomPwd(formPrefix = '') {
 			}
 		}
 	}
-	
+	// 未自动填充时也可从 URL 读取用户名（autojoin 模式）
+	// Read username from URL even without auto-fill (autojoin mode)
+	const urlParamsForAutojoin = params;
+	const usernameBeforeClear = formPrefix === '' ? urlParamsForAutojoin.get('u') : '';
+
+	// uniapp 外壳自动进房模式：?autojoin=1 且无 prefix（主登录表单）
+	// uniapp shell autojoin mode: ?autojoin=1 and empty prefix (main login form)
+	const autojoin = formPrefix === '' && params.get('autojoin') === '1';
+
 	// Clear URL parameters for security
 	if (roomValue || pwdValue) {
 		window.history.replaceState({}, '', location.pathname);
+	}
+
+	// 自动提交登录表单（利用已注册的 submit 处理器，保持原有校验逻辑）
+	// Auto submit the login form (reuses the registered submit handler and its validation)
+	if (autojoin) {
+		if (usernameBeforeClear) {
+			const userEl = document.getElementById('userName');
+			if (userEl && !userEl.value) userEl.value = usernameBeforeClear;
+		}
+		const formEl = document.getElementById('login-form');
+		if (formEl) {
+			setTimeout(() => {
+				formEl.dispatchEvent(new Event('submit', { cancelable: true }));
+			}, 120);
+		}
 	}
 }
 

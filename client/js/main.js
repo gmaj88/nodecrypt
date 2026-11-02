@@ -83,6 +83,11 @@ import {	renderUserList,       // 渲染用户列表 / Render user list
 // 导入语音聊天模块 / Import voice chat module
 import { initVoiceChat, getVoiceChat, VoiceChat } from './util.voice.js';
 
+// 导入 uniapp 原生外壳桥接模块 / Import uniapp native shell bridge module
+import {
+	initNativeBridge    // 初始化原生桥接 / Initialize native bridge
+} from './util.native.js';
+
 // 设置全局配置参数
 // Set global configuration parameters
 window.config = {
@@ -90,6 +95,10 @@ window.config = {
 	//wsAddress: `wss://crypt.works`,
 	debug: true                       // 是否开启调试模式 / Enable debug mode
 };
+
+// 初始化 uniapp 原生外壳桥接（APP 内运行时生效，自动读取 URL 中的 pushCid）
+// Initialize the uniapp native shell bridge (only active inside the APP, reads pushCid from URL)
+initNativeBridge();
 
 // 在文档开始加载前就初始化语言设置，防止闪烁
 // Initialize language settings before document starts loading

@@ -1,4 +1,5 @@
 import { generateClientId, encryptMessage, decryptMessage, logEvent, isString, isObject, getTime } from './utils.js';
+import { upsertDevice, markDeviceOffline, notifyOfflineDevices } from './push.js';
 
 export default {
   async fetch(request, env, ctx) {
@@ -25,6 +26,7 @@ export default {
 
 export class ChatRoom {  constructor(state, env) {
     this.state = state;
+    this.env = env;
     
     // Use objects like original server.js instead of Maps
     this.clients = {};
@@ -244,7 +246,10 @@ export class ChatRoom {  constructor(state, env) {
     connection.addEventListener('close', async (event) => {
       logEvent('close', [clientId, event], 'debug');
 
-      const channel = this.clients[clientId].channel;
+      // cleanupOldConnections 可能已删除该客户端，需要防御缺失
+      // cleanupOldConnections may have already deleted this client; guard against it
+      const clientInfo = this.clients[clientId];
+      const channel = clientInfo ? (clientInfo.channel || null) : null;
 
       if (channel && this.channels[channel]) {
         this.channels[channel].splice(this.channels[channel].indexOf(clientId), 1);
@@ -272,13 +277,23 @@ export class ChatRoom {  constructor(state, env) {
         }
       }
 
+      // 将该连接关联的推送设备标记为离线，使其成为离线推送的目标
+      // Mark push devices linked to this connection offline so they become offline push targets
+      if (channel) {
+        try {
+          await markDeviceOffline(this.state.storage, channel, clientId);
+        } catch (error) {
+          logEvent('close-device-offline', [clientId, error], 'error');
+        }
+      }
+
       if (this.clients[clientId]) {
         delete(this.clients[clientId]);
       }
     });
   }
   // Process encrypted messages
-  processEncryptedMessage(clientId, message) {
+  async processEncryptedMessage(clientId, message) {
     let decrypted = null;
 
     try {
@@ -295,9 +310,11 @@ export class ChatRoom {  constructor(state, env) {
       if (action === 'j') {
         this.handleJoinChannel(clientId, decrypted);
       } else if (action === 'c') {
-        this.handleClientMessage(clientId, decrypted);
+        await this.handleClientMessage(clientId, decrypted);
       } else if (action === 'w') {
-        this.handleChannelMessage(clientId, decrypted);
+        await this.handleChannelMessage(clientId, decrypted);
+      } else if (action === 'dr') {
+        await this.handleDeviceRegistration(clientId, decrypted);
       }
 
     } catch (error) {
@@ -329,8 +346,24 @@ export class ChatRoom {  constructor(state, env) {
       logEvent('message-join', [clientId, error], 'error');
     }
   }
+  // Handle offline push device registration (channel known from this connection's join)
+  // 处理离线推送设备注册（频道取自该连接加入过的房间）
+  async handleDeviceRegistration(clientId, decrypted) {
+    if (!isString(decrypted.p) || !this.clients[clientId].channel) {
+      return;
+    }
+    const pushToken = decrypted.p;
+    if (pushToken.length > 128) {
+      return;
+    }
+    try {
+      await upsertDevice(this.state.storage, this.clients[clientId].channel, pushToken, clientId);
+    } catch (error) {
+      logEvent('device-register', [clientId, error], 'error');
+    }
+  }
   // Handle client messages
-  handleClientMessage(clientId, decrypted) {
+  async handleClientMessage(clientId, decrypted) {
     if (!isString(decrypted.p) || !isString(decrypted.c) || !this.clients[clientId].channel) {
       return;
     }
@@ -350,17 +383,21 @@ export class ChatRoom {  constructor(state, env) {
         this.sendMessage(targetClient.connection, encrypted);
 
         messageObj.p = null;
+
+        // 私聊消息转发后，对本频道离线注册设备触发通知（不包含任何明文）
+        // After relaying a private message, notify offline registered devices of the channel (no plaintext)
+        await notifyOfflineDevices(this.env, this.state.storage, channel);
       }
 
     } catch (error) {
       logEvent('message-client', [clientId, error], 'error');
     }
   }  // Handle channel messages
-  handleChannelMessage(clientId, decrypted) {
+  async handleChannelMessage(clientId, decrypted) {
     if (!isObject(decrypted.p) || !this.clients[clientId].channel) {
       return;
     }
-    
+
     try {
       const channel = this.clients[clientId].channel;
       // 过滤有效的目标成员
@@ -381,6 +418,10 @@ export class ChatRoom {  constructor(state, env) {
 
         messageObj.p = null;
       }
+
+      // 房间消息转发后，对本频道离线注册设备触发通知（不包含任何明文）
+      // After relaying a channel message, notify offline registered devices of the channel (no plaintext)
+      await notifyOfflineDevices(this.env, this.state.storage, channel);
 
     } catch (error) {
       logEvent('message-channel', [clientId, error], 'error');
@@ -457,6 +498,16 @@ export class ChatRoom {  constructor(state, env) {
     for (const clientId of clientsToRemove) {
       try {
         logEvent('connection-seen', clientId, 'debug');
+        // close 时 clients 已被删除，这里统一补齐设备离线标记
+        // close event won't find the client anymore, so mark push devices offline here
+        const removedChannel = this.clients[clientId] ? this.clients[clientId].channel : null;
+        if (removedChannel) {
+          try {
+            await markDeviceOffline(this.state.storage, removedChannel, clientId);
+          } catch (error) {
+            logEvent('cleanup-device-offline', [clientId, error], 'error');
+          }
+        }
         this.clients[clientId].connection.close();
         delete this.clients[clientId];
       } catch (error) {

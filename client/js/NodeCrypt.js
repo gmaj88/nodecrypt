@@ -70,6 +70,9 @@ class NodeCrypt {
 		this.decryptServerMessage = this.decryptServerMessage.bind(this);
 		this.encryptClientMessage = this.encryptClientMessage.bind(this);
 		this.decryptClientMessage = this.decryptClientMessage.bind(this)
+		// uniapp APP 外壳的推送设备标识（URL 传入,用于离线推送注册）
+		// Push token of the uniapp APP shell (passed via URL, used for offline push registration)
+		this.pushToken = (typeof window !== 'undefined' && typeof window.nativePushToken === 'string' && window.nativePushToken) || null;
 	}
 
 	// Set user credentials (username, channel, password)
@@ -219,6 +222,14 @@ class NodeCrypt {
 						a: 'j',
 						p: this.credentials.channel
 					}, this.serverShared));
+					// 向服务器注册离线推送设备（加密通道内,服务器只知道房间哈希）
+					// Register offline push device (inside the encrypted channel, server only knows the room hash)
+					if (this.pushToken) {
+						this.sendMessage(this.encryptServerMessage({
+							a: 'dr',
+							p: this.pushToken
+						}, this.serverShared));
+					}
 					if (this.callbacks.onServerSecured) {
 						try {
 							this.callbacks.onServerSecured()

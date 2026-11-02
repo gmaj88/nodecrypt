@@ -113,6 +113,7 @@ export function joinRoom(userName, roomName, password, modal = null, onResult) {
 	if (sidebarUsername) sidebarUsername.textContent = userName;
 	setSidebarAvatar(userName);
 	let closed = false;
+	let chatInst = null;
 	const callbacks = {
 		onServerClosed: () => {
 			setStatus('Node connection closed');
@@ -140,6 +141,15 @@ export function joinRoom(userName, roomName, password, modal = null, onResult) {
 			if (voiceBtn && VoiceChat && VoiceChat.isSupported()) {
 				voiceBtn.style.display = 'flex';
 			}
+			// 通知 uniapp 原生层：已加入房间（含房间哈希，用于离线推送与频道路由）
+			// Notify the native layer: room joined (with room hash for offline push and channel routing)
+			if (window.__postToNative && chatInst && chatInst.credentials) {
+				window.__postToNative({
+					type: 'nodecrypt-joined',
+					room: roomName,
+					hash: chatInst.credentials.channel
+				});
+			}
 			if (onResult && !closed) {
 				closed = true;
 				onResult(true)
@@ -151,7 +161,7 @@ export function joinRoom(userName, roomName, password, modal = null, onResult) {
 		onClientLeft: (clientId) => handleClientLeft(idx, clientId),
 		onClientMessage: (msg) => handleClientMessage(idx, msg)
 	};
-	const chatInst = new window.NodeCrypt(window.config, callbacks);
+	chatInst = new window.NodeCrypt(window.config, callbacks);
 	chatInst.setCredentials(userName, roomName, password);
 	chatInst.connect();
 	roomsData[idx].chat = chatInst
@@ -260,6 +270,19 @@ export function handleClientLeft(idx, clientId) {
 export function handleClientMessage(idx, msg) {
 	const newRd = roomsData[idx];
 	if (!newRd) return;
+
+	// 通知 uniapp 原生层收到新消息（用于未读角标；语音信令不计入）
+	// Notify the native layer of a new message (for unread badge; voice signaling excluded)
+	if (window.__postToNative && !String(msg.type || '').startsWith('voice-')) {
+		window.__postToNative({
+			type: 'nodecrypt-msg',
+			room: newRd.roomName,
+			hash: newRd.chat && newRd.chat.credentials ? newRd.chat.credentials.channel : '',
+			msgType: msg.type || 'text',
+			private: String(msg.type || '').includes('_private'),
+			ts: Date.now()
+		});
+	}
 
 	// Prevent processing own messages unless it's a private message sent to oneself
 	if (msg.clientId === newRd.myId && msg.userName === newRd.myUserName && !msg.type.includes('_private')) {
