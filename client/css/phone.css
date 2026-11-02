@@ -277,7 +277,45 @@
 	margin-left: 6px;
 }
 
-.voice-header-action {
-	font-size: 10px;
-	padding: 1px 6px;
-}
+	.voice-header-action {
+		font-size: 10px;
+		padding: 1px 6px;
+	}
+
+	/* 顶部状态栏窄屏两行布局 / Top status bar two-row layout on narrow screens
+	 * 第一行：房间名；第二行：在线成员 + 语音通话状态
+	 * Row 1: room name; Row 2: members count + voice indicator */
+	.main-header {
+		min-height: 0;
+	}
+
+	.main-header-center {
+		flex: 1;
+		min-width: 0;
+	}
+
+	.main-header-flex {
+		flex-wrap: wrap;
+		align-items: center;
+		justify-content: center;
+		gap: 2px 8px;
+	}
+
+	.group-title {
+		margin-left: 0;
+		width: 100%;
+		font-size: 16px;
+		text-align: center;
+		white-space: nowrap;
+		overflow: hidden;
+		text-overflow: ellipsis;
+	}
+
+	.main-header-members {
+		white-space: nowrap;
+		font-size: 12px;
+	}
+
+	.voice-header-indicator {
+		margin-left: 0;
+	}
