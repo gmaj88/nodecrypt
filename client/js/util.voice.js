@@ -15,6 +15,9 @@ export class VoiceChat {
 		this.audioElements = new Map();
 		this.isMuted = false;
 		this.isInCall = false;
+		// 无麦克风时置 true：仅听模式，仍接收他人音频
+		// true when mic is unavailable: listen-only mode, still receive others' audio
+		this.listenOnly = false;
 		this.callStartTime = null;
 		this.timerInterval = null;
 		this.pendingCandidates = new Map();
@@ -115,12 +118,16 @@ export class VoiceChat {
 				audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
 				video: false
 			});
+			this.listenOnly = false;
 		} catch (e) {
 			// 输出具体错误类型（NotAllowed/NotFound/NotReadable 等）便于定位
 			// Log the concrete error name to help diagnosis
 			console.error('[VoiceChat] getUserMedia failed:', e && e.name, e);
+			// 麦克风不可用时不再退出，转为仅听模式继续加入，可正常听到其他人
+			// When mic is unavailable, don't bail out — join in listen-only mode and keep receiving others
 			addSystemMsg(this.describeMicError(e));
-			return;
+			addSystemMsg(t('voice.listen_only', 'No microphone — joining in listen-only mode, you can still hear others'));
+			this.listenOnly = true;
 		}
 
 		try {
@@ -179,6 +186,10 @@ export class VoiceChat {
 			this.localStream.getTracks().forEach(track => {
 				pc.addTrack(track, this.localStream);
 			});
+		} else if (this.listenOnly) {
+			// 仅听模式：声明只接收的音频 transceiver，对端仍会向我们发送音频
+			// Listen-only: declare a recvonly audio transceiver so peers still send audio to us
+			pc.addTransceiver('audio', { direction: 'recvonly' });
 		}
 
 		pc.ontrack = (event) => {
@@ -378,7 +389,7 @@ export class VoiceChat {
 		if (this.isInCall) {
 			this.updateVoiceUI(true);
 			this.updateCallIndicator();
-			if (this.peerConnections.size === 0 && this.getLocalTracks().length > 0) {
+			if (this.peerConnections.size === 0 && (this.getLocalTracks().length > 0 || this.listenOnly)) {
 				addSystemMsg(t('voice.all_left', 'All participants have left'));
 			}
 		}
@@ -426,6 +437,7 @@ export class VoiceChat {
 			this.audioCtx = null;
 		}
 		this.isMuted = false;
+		this.listenOnly = false;
 		this.isInCall = false;
 		this.callStartTime = null;
 		this.stopTimer();
@@ -438,7 +450,9 @@ export class VoiceChat {
 	}
 
 	onNewPeerJoined(peerId) {
-		if (!this.isInCall || !this.localStream) return;
+		// 仅听模式也需为新成员建立连接（recvonly offer），继续接收其音频
+		// Listen-only peers also connect to new members (recvonly offer) to keep receiving audio
+		if (!this.isInCall) return;
 		const peers = this.getPeersWithSharedKey();
 		if (!peers.some(p => p.peerId === peerId)) return;
 		this.sendVoiceSignalingTo(peerId, 'voice-active', {});
