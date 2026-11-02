@@ -113,21 +113,38 @@ export class VoiceChat {
 			return;
 		}
 
+		// 预检输入设备：无麦克风时直接进入仅听模式，不再触发权限探测
+		// Pre-check input devices: enter listen-only directly when no mic, skip the permission probe
+		let micAvailable = true;
 		try {
-			this.localStream = await navigator.mediaDevices.getUserMedia({
-				audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
-				video: false
-			});
-			this.listenOnly = false;
-		} catch (e) {
-			// 输出具体错误类型（NotAllowed/NotFound/NotReadable 等）便于定位
-			// Log the concrete error name to help diagnosis
-			console.error('[VoiceChat] getUserMedia failed:', e && e.name, e);
-			// 麦克风不可用时不再退出，转为仅听模式继续加入，可正常听到其他人
-			// When mic is unavailable, don't bail out — join in listen-only mode and keep receiving others
-			addSystemMsg(this.describeMicError(e));
+			if (navigator.mediaDevices && typeof navigator.mediaDevices.enumerateDevices === 'function') {
+				const devices = await navigator.mediaDevices.enumerateDevices();
+				micAvailable = devices.some((d) => d.kind === 'audioinput' && d.deviceId);
+			}
+		} catch (e) { /* 预检失败时按“可能有麦克风”处理 / fall back to assuming a mic exists */ }
+
+		if (!micAvailable) {
+			console.warn('[VoiceChat] no audio input device detected, entering listen-only mode');
+			addSystemMsg(t('voice.mic_not_found', 'No microphone detected on this device'));
 			addSystemMsg(t('voice.listen_only', 'No microphone — joining in listen-only mode, you can still hear others'));
 			this.listenOnly = true;
+		} else {
+			try {
+				this.localStream = await navigator.mediaDevices.getUserMedia({
+					audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
+					video: false
+				});
+				this.listenOnly = false;
+			} catch (e) {
+				// 输出具体错误类型（NotAllowed/NotFound/NotReadable 等）便于定位
+				// Log the concrete error name to help diagnosis
+				console.error('[VoiceChat] getUserMedia failed:', e && e.name, e);
+				// 麦克风不可用时不再退出，转为仅听模式继续加入，可正常听到其他人
+				// When mic is unavailable, don't bail out — join in listen-only mode and keep receiving others
+				addSystemMsg(this.describeMicError(e));
+				addSystemMsg(t('voice.listen_only', 'No microphone — joining in listen-only mode, you can still hear others'));
+				this.listenOnly = true;
+			}
 		}
 
 		try {
