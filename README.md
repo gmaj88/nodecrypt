@@ -181,6 +181,13 @@ sequenceDiagram
 - 验证：`curl -4 --resolve "你的域名:443:104.21.91.195" https://你的域名/` 若返回 200 而默认路径超时，即此问题；
 - 解决（任选其一）：在 `C:\Windows\System32\drivers\etc\hosts` 强制 IPv4（`104.21.91.195 你的域名`）；或在网络适配器属性中停用 IPv6；或切换网络环境。
 
+### APP 内听不到对方讲话（uniapp web-view 远端音频无声）
+现象：APP 内能被别人听到，但自己听不到任何人；"通话音量"条出现、听筒贴耳也无声。这是 Android WebView 的媒体策略问题，与 uniPush 1.0/2.0 无关：
+- 根因：远端 WebRTC 音频在 `ontrack` 后异步调用 `play()`，已脱离点击手势，WebView 默认 `setMediaPlaybackRequiresUserGesture(true)` 会静默拦截；
+- 已实现三重修复：在「打开音频」点击手势内创建/恢复 `AudioContext`；远端流同时经 WebAudio sink 播放（走媒体音量流，绕开拦截）；`chat.vue` 对底层 WebView 反射设置 `setMediaPlaybackRequiresUserGesture(false)`（重打包后生效）；
+- 排查日志：console 中 `[VoiceChat]` 前缀输出 `media-check`（候选对类型 / inbound packets / trackMuted）。若 `inbound packets=0` 则是跨网 NAT 打洞问题，需要 TURN（如 Cloudflare Calls TURN）；
+- 兜底提示：8 秒无声时页面会提示"点一下屏幕（手势解锁）并检查媒体/通话音量"。
+
 ---
 ## Star History
 
