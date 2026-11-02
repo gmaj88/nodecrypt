@@ -38,6 +38,22 @@ export class VoiceChat {
 		return rd && rd.chat ? rd.chat : null;
 	}
 
+	// 将 getUserMedia 错误类型映射为可读提示，避免一律报"被拒绝"
+	// Map getUserMedia error types to readable messages instead of one generic "denied"
+	describeMicError(e) {
+		const name = e && e.name;
+		if (name === 'NotAllowedError' || name === 'SecurityError') {
+			return t('voice.permission_denied', 'Microphone access denied — allow microphone for this site in browser settings, then retry');
+		} else if (name === 'NotFoundError' || name === 'DevicesNotFoundError') {
+			return t('voice.mic_not_found', 'No microphone detected on this device');
+		} else if (name === 'NotReadableError' || name === 'TrackStartError') {
+			return t('voice.mic_busy', 'Microphone is in use by another application');
+		} else if (name === 'OverconstrainedError') {
+			return t('voice.mic_constraint', 'Audio options are not supported by this device');
+		}
+		return t('voice.mic_error', 'Failed to access the microphone');
+	}
+
 	getPeersWithSharedKey() {
 		const chat = this.getCurrentRoomChat();
 		if (!chat) return [];
@@ -100,8 +116,10 @@ export class VoiceChat {
 				video: false
 			});
 		} catch (e) {
-			console.error('[VoiceChat] getUserMedia failed:', e);
-			addSystemMsg(t('voice.permission_denied', 'Microphone access denied'));
+			// 输出具体错误类型（NotAllowed/NotFound/NotReadable 等）便于定位
+			// Log the concrete error name to help diagnosis
+			console.error('[VoiceChat] getUserMedia failed:', e && e.name, e);
+			addSystemMsg(this.describeMicError(e));
 			return;
 		}
 
