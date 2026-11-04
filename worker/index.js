@@ -1,5 +1,6 @@
 import { generateClientId, encryptMessage, decryptMessage, logEvent, isString, isObject, getTime } from './utils.js';
-import { upsertDevice, markDeviceOffline, notifyOfflineDevices } from './push.js';
+import { upsertDevice, markDeviceOffline, notifyOfflineDevices, listAllDevices, debugPush } from './push.js';
+import { getVoiceTurnIceServers } from './voiceTurn.js';
 
 export default {
   async fetch(request, env, ctx) {
@@ -8,6 +9,23 @@ export default {
     // 处理WebSocket请求
     const upgradeHeader = request.headers.get('Upgrade');
     if (upgradeHeader && upgradeHeader === 'websocket') {
+      const id = env.CHAT_ROOM.idFromName('chat-room');
+      const stub = env.CHAT_ROOM.get(id);
+      return stub.fetch(request);
+    }
+
+    // 语音 TURN 凭据端点：返回短时 ICE 服务器配置（失败时客户端降级纯 STUN）
+    // Voice TURN endpoint: short-lived ICE config; clients fall back to STUN-only on failure
+    if (url.pathname === '/voice-turn') {
+      const iceServers = await getVoiceTurnIceServers();
+      return new Response(JSON.stringify({ iceServers }), {
+        headers: { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' }
+      });
+    }
+
+    // 推送诊断端点：把请求转交给 ChatRoom DO（设备与推送记录都在它这里）
+    // Push diagnostic endpoint: forward requests to the ChatRoom DO (devices & push records live there)
+    if (url.pathname === '/api/push-test') {
       const id = env.CHAT_ROOM.idFromName('chat-room');
       const stub = env.CHAT_ROOM.get(id);
       return stub.fetch(request);
@@ -109,6 +127,27 @@ export class ChatRoom {  constructor(state, env) {
   }
 
   async fetch(request) {
+    const url = new URL(request.url);
+
+    // 推送诊断端点（临时排查用）：不带 hash 仅列出设备；?hash=x&push=1 实际下发一条推送并返回全过程
+    // Push diagnostic endpoint (temporary): without hash lists devices; with ?hash=x&push=1 sends a test push
+    if (url.pathname === '/api/push-test') {
+      try {
+        const params = url.searchParams;
+        const hash = params.get('hash');
+        if (hash) {
+          const data = params.get('push') === '1'
+            ? await debugPush(this.env, this.state.storage, hash)
+            : { channelHash: hash, note: 'add &push=1 to send a test push' };
+          return new Response(JSON.stringify(data), { headers: { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' } });
+        }
+        const devices = await listAllDevices(this.state.storage);
+        return new Response(JSON.stringify({ note: 'add ?hash=<hash>&push=1 to send a test push', keys: devices }), { headers: { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' } });
+      } catch (error) {
+        return new Response(JSON.stringify({ error: String(error && error.message || error) }), { status: 500, headers: { 'Content-Type': 'application/json' } });
+      }
+    }
+
     // Check for WebSocket upgrade
     const upgradeHeader = request.headers.get('Upgrade');
     if (!upgradeHeader || upgradeHeader !== 'websocket') {

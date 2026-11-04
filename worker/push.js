@@ -1,5 +1,5 @@
-// 离线推送适配器（uniPush 2.0 / 个推 REST v2）
-// Offline push adapter for uniPush 2.0 (Getui REST API v2)
+// 离线推送适配器（uniPush 1.0 / 个推 REST v2）
+// Offline push adapter for uniPush 1.0 (Getui REST API v2)
 // 设计原则：服务器是盲中继 —— 推送内容不含消息明文、不含房间名，只有房间哈希（与加入房间时上报的一致）
 // Design principle: server is a blind relay - push body carries no message plaintext, no room name,
 // only the room hash (the same value reported at room join).
@@ -189,5 +189,84 @@ export async function notifyOfflineDevices(env, storage, channelHash) {
 		}
 	} catch (error) {
 		console.error('notifyOfflineDevices error', error);
+	}
+}
+
+// 列出 DO 中全部已注册设备（调试端点用）
+// List every registered device in DO storage (used by the debug endpoint)
+export async function listAllDevices(storage) {
+	const result = [];
+	const entries = await storage.list({ prefix: 'devices:' });
+	const now = Date.now();
+	for (const [key, devices] of entries) {
+		const deviceList = [];
+		for (const cid in devices) {
+			const record = devices[cid];
+			deviceList.push({ cid, online: record.online ? true : false, seenAt: record.seen || null, fresh: Boolean(record.seen && now - record.seen <= deviceRecordTtl) });
+		}
+		result.push({ hash: key.slice('devices:'.length), devices: deviceList });
+	}
+	return result;
+}
+
+// 推送调试变体：返回完整过程数据（设备清单/鉴权结果/每个 cid 的个推响应原文）
+// Debug variant of push: full process data (device list / auth result / per-cid Getui response)
+export async function debugPush(env, storage, channelHash) {
+	try {
+		if (!isConfigured(env)) {
+			return { error: 'GETUI secrets not configured' };
+		}
+		const key = `devices:${channelHash}`;
+		const devices = (await storage.get(key)) || {};
+		const now = Date.now();
+		const deviceList = [];
+		for (const cid in devices) {
+			const record = devices[cid];
+			deviceList.push({ cid, online: record.online ? true : false, seenAt: record.seen || null, fresh: Boolean(record.seen && now - record.seen <= deviceRecordTtl) });
+		}
+		const offlineTokens = await listOfflineDevices(storage, channelHash);
+		const result = {
+			channelHash,
+			deviceCount: deviceList.length,
+			devices: deviceList,
+			offlineTokens: offlineTokens.length,
+			auth: 'pending',
+			pushResults: []
+		};
+		const token = await getGetuiToken(env, storage);
+		if (!token) {
+			result.auth = 'failed';
+			return result;
+		}
+		result.auth = 'ok';
+		const payload = JSON.stringify({ type: 'nodecrypt-msg', hash: channelHash });
+		for (const cid of offlineTokens) {
+			try {
+				const response = await fetch(`${GETUI_REST_BASE}/${env.GETUI_APP_ID}/push/single/cid`, {
+					method: 'POST',
+					headers: { 'Content-Type': 'application/json', 'token': token },
+					body: JSON.stringify({
+						request_id: requestId(),
+						settings: { ttl: 3600000 },
+						push_message: {
+							notification: {
+								title: 'NodeCrypt',
+								body: '您有新的加密消息 / You have a new encrypted message',
+								click_type: 'startapp',
+								payload: payload
+							}
+						}
+					})
+				});
+				let json = null;
+				try { json = await response.json(); } catch (e) { /* non-JSON response */ }
+				result.pushResults.push({ cid, http: response.status, code: json ? json.code : null, msg: json ? json.msg : null });
+			} catch (error) {
+				result.pushResults.push({ cid, error: String(error && error.message || error) });
+			}
+		}
+		return result;
+	} catch (error) {
+		return { error: String(error && error.message || error) };
 	}
 }

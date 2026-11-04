@@ -8,6 +8,10 @@ const ICE_SERVERS = [
 	{ urls: 'stun:stun1.l.google.com:19302' }
 ];
 
+// 远端音频无声时的兜底提示（8 秒后仍未播放）
+// Recovery hint when remote audio stays silent after 8 seconds
+const SOUND_HINT_DELAY_MS = 8000;
+
 export class VoiceChat {
 	constructor() {
 		this.localStream = null;
@@ -28,8 +32,13 @@ export class VoiceChat {
 		// WebAudio fallback route: <audio> may be autoplay-blocked in WebView;
 		// routing the remote stream through WebAudio bypasses that (media volume stream)
 		this.audioSources = new Map();
-		this.statsTimers = new Map();
+		this.hintTimers = new Map();
 		this.audioUnlockBound = null;
+		// ICE 服务器：默认 STUN，通话开始时尝试加载 TURN（蜂窝 NAT 兜底）
+		// ICE servers: STUN by default; TURN loaded at call start when available (cellular NAT fallback)
+		this.iceServers = ICE_SERVERS.slice();
+		this.turnLoaded = false;
+		this.turnPromise = null;
 
 		this.handleSignalingMessage = this.handleSignalingMessage.bind(this);
 		this.destroy = this.destroy.bind(this);
@@ -47,6 +56,28 @@ export class VoiceChat {
 	getCurrentRoomChat() {
 		const rd = roomsData[activeRoomIndex];
 		return rd && rd.chat ? rd.chat : null;
+	}
+
+	// 通话开始时从 /voice-turn 拉取 TURN 配置并缓存；任何失败都回落到默认 STUN
+	// Fetch TURN config from /voice-turn at call start and cache it; any failure keeps STUN-only
+	loadIceServers() {
+		if (!this.turnLoaded) {
+			if (!this.turnPromise) {
+				this.turnPromise = (async () => {
+					try {
+						const response = await fetch('/voice-turn', { cache: 'no-store' });
+						if (response.ok) {
+							const data = await response.json();
+							if (data && Array.isArray(data.iceServers) && data.iceServers.length > 0) {
+								this.iceServers = data.iceServers;
+							}
+						}
+					} catch (e) { /* 保持 STUN 兜底 / keep STUN fallback */ }
+				})();
+			}
+			this.turnPromise.finally(() => { this.turnLoaded = true; });
+		}
+		return this.turnPromise;
 	}
 
 	// 将 getUserMedia 错误类型映射为可读提示，避免一律报"被拒绝"
@@ -119,19 +150,25 @@ export class VoiceChat {
 		// Create the AudioContext in the synchronous phase of the user gesture (WebView audio unlock depends on it)
 		this.ensureAudioUnlocked();
 
+		// 加载 TURN 配置（蜂窝网络 NAT 兜底；失败时不阻塞通话，退回纯 STUN）
+		// Load TURN config (cellular NAT fallback; never blocks on failure, falls back to STUN)
+		await this.loadIceServers();
+
 		const peers = this.getPeersWithSharedKey();
 		if (peers.length === 0) {
 			addSystemMsg(t('voice.no_peers', 'No other members to call'));
 			return;
 		}
 
-		// 预检输入设备：无麦克风时直接进入仅听模式，不再触发权限探测
-		// Pre-check input devices: enter listen-only directly when no mic, skip the permission probe
+		// 预检输入设备：枚举结果非空且完全没有音频输入时才进入仅听模式
+		// （WebView 常返回空列表/空 deviceId，不代表无麦克风，应照常尝试采集）
+		// Pre-check: enter listen-only only when enumeration is non-empty yet has zero audio inputs;
+		// WebView often returns empty lists / blank deviceIds, which does NOT mean no mic exists
 		let micAvailable = true;
 		try {
 			if (navigator.mediaDevices && typeof navigator.mediaDevices.enumerateDevices === 'function') {
 				const devices = await navigator.mediaDevices.enumerateDevices();
-				micAvailable = devices.some((d) => d.kind === 'audioinput' && d.deviceId);
+				micAvailable = devices.length > 0 && !devices.some((d) => d.kind === 'audioinput');
 			}
 		} catch (e) { /* 预检失败时按“可能有麦克风”处理 / fall back to assuming a mic exists */ }
 
@@ -208,7 +245,7 @@ export class VoiceChat {
 			this.pendingCandidates.set(peerId, savedCandidates);
 		}
 
-		const pc = new RTCPeerConnection({ iceServers: ICE_SERVERS });
+		const pc = new RTCPeerConnection({ iceServers: this.iceServers });
 
 		if (this.localStream) {
 			this.localStream.getTracks().forEach(track => {
@@ -236,17 +273,14 @@ export class VoiceChat {
 
 		pc.onconnectionstatechange = () => {
 			const state = pc.connectionState;
-			console.log(`[VoiceChat] connectionState (${peerId}): ${state}`);
 			if (state === 'failed' || state === 'closed') {
 				this.handlePeerDisconnected(peerId);
 			} else if (state === 'connected') {
 				this.updateVoiceUI(true);
-				this.schedulePeerStats(peerId, pc);
 			}
 		};
 
 		pc.oniceconnectionstatechange = () => {
-			console.log(`[VoiceChat] iceConnectionState (${peerId}): ${pc.iceConnectionState}`);
 			if (pc.iceConnectionState === 'failed') {
 				this.restartIceForPeer(peerId);
 			}
@@ -256,55 +290,8 @@ export class VoiceChat {
 		return pc;
 	}
 
-	// 建连 5 秒后输出单行媒体摘要：候选对类型/入站包数/轨道状态
-	// One-line media digest 5s after connect: candidate pair type / inbound packets / track state
-	schedulePeerStats(peerId, pc) {
-		if (this.statsCacheTimer) clearTimeout(this.statsCacheTimer);
-		this.statsCacheTimer = setTimeout(async () => {
-			try {
-				const stats = await pc.getStats();
-				let pairLine = 'pair=none';
-				let inboundLine = 'inbound=none';
-				stats.forEach((report) => {
-					if (report.type === 'candidate-pair' && (report.selected === true || report.state === 'succeeded' && report.nominated === true)) {
-						const local = stats.get(report.localCandidateId);
-						const remote = stats.get(report.remoteCandidateId);
-						pairLine = `pair=${local ? local.candidateType : '?'}(${local ? local.protocol : '?'})>${remote ? remote.candidateType : '?'}(${remote ? remote.protocol : '?'})`;
-					}
-					if (report.type === 'inbound-rtp' && (report.kind === 'audio' || report.mediaType === 'audio')) {
-						let muted = '?';
-						try {
-							const trackStats = stats.get(report.trackId);
-							if (trackStats) muted = String(trackStats.muted);
-							else if (report.trackId) {
-								const track = pc.getReceivers().map(r => r.track).find(tr => tr.id === report.trackId);
-								if (track) muted = String(track.muted);
-							}
-						} catch (e) { /* ignore */ }
-						inboundLine = `inbound packets=${report.packetsReceived !== undefined ? report.packetsReceived : '?'} bytes=${report.bytesReceived !== undefined ? report.bytesReceived : '?'} lost=${report.packetsLost !== undefined ? report.packetsLost : '?'} trackMuted=${muted}`;
-					}
-				});
-				this.logPeerStatsLine(peerId, pairLine, inboundLine);
-			} catch (e) { /* getStats unsupported */ }
-		}, 5000);
-	}
-
-	logPeerStatsLine(peerId, pairLine, inboundLine) {
-		const audio = this.audioElements.get(peerId);
-		const playing = audio ? !audio.paused : 'no-element';
-		console.log(`[VoiceChat] media-check (${peerId}): ${pairLine} | ${inboundLine} | elementPlaying=${playing}`);
-	}
-
 	setupAudioElement(peerId, stream) {
 		this.removeAudioElement(peerId);
-		// 同步上报远端轨道状态，便于区分“没有数据”与“数据到达但未播放”
-		// Report remote track state to tell "no data" from "data arrives but not playing"
-		try {
-			const track = stream.getAudioTracks()[0];
-			if (track) {
-				console.log(`[VoiceChat] remote track (${peerId}): muted=${track.muted} enabled=${track.enabled} readyState=${track.readyState}`);
-			}
-		} catch (e) { /* ignore */ }
 		const audio = document.createElement('audio');
 		audio.srcObject = stream;
 		audio.autoplay = true;
@@ -316,13 +303,10 @@ export class VoiceChat {
 		document.body.appendChild(audio);
 		this.audioElements.set(peerId, audio);
 
-		audio.play().then(() => {
-			console.log(`[VoiceChat] remote audio element playing (${peerId})`);
-		}).catch((e) => {
-			// 明确标记自动播放被拦截，一次手势后重试
-			// Tag the autoplay block explicitly; retry once after any gesture
-			console.warn(`[VoiceChat] autoplay-blocked (${peerId}):`, e && e.name, e && e.message);
-			this.armUnlockRetry(peerId, audio);
+		audio.play().catch(() => {
+			// 元素播放被拦截（自动播放策略）时，一次手势后重试
+			// When element playback is blocked by autoplay policy, retry after a gesture
+			this.armUnlockRetry();
 		});
 
 		// WebAudio 兜底：媒体音量流 + 独立于 <audio> 的播放 sink
@@ -332,40 +316,33 @@ export class VoiceChat {
 				const source = this.audioCtx.createMediaStreamSource(stream);
 				source.connect(this.audioCtx.destination);
 				this.audioSources.set(peerId, source);
-				console.log(`[VoiceChat] webaudio sink attached (${peerId}), ctx.state=${this.audioCtx.state}`);
-			} catch (e) {
-				console.warn('[VoiceChat] webaudio attach failed:', e && e.name, e);
-			}
+			} catch (e) { /* WebAudio 不可用时仍依赖 <audio> 元素 */ }
 		}
 
 		// 8 秒后仍无声则给出恢复提示（点击屏幕 / 检查音量）
 		// After 8s of silence, surface a recovery hint (tap screen / check volume)
 		const hintTimer = setTimeout(() => {
 			if (this.audioElements.get(peerId) === audio && audio.paused) {
-				console.warn(`[VoiceChat] still silent after 8s (${peerId})`);
 				addSystemMsg(t('voice.sound_hint', 'No remote sound yet — tap the screen once and check media/voice-call volume'));
-				this.armUnlockRetry(peerId, audio);
+				this.armUnlockRetry();
 			}
-		}, 8000);
-		if (this.statsTimers.has(peerId)) clearTimeout(this.statsTimers.get(peerId));
-		this.statsTimers.set(peerId, hintTimer);
+		}, SOUND_HINT_DELAY_MS);
+		this.hintTimers.set(peerId, hintTimer);
 
 		if (this.isInCall) this.updateVoiceUI(true);
 	}
 
 	// 手势解锁：恢复 AudioContext 并重试所有待播放元素
 	// Gesture unlock: resume the AudioContext and retry every pending element
-	armUnlockRetry(peerId, audio) {
+	armUnlockRetry() {
 		if (this.audioUnlockBound) return;
 		this.audioUnlockBound = () => {
 			this.audioUnlockBound = null;
 			if (this.audioCtx && this.audioCtx.state === 'suspended') {
 				this.audioCtx.resume().catch(() => {});
 			}
-			for (const [pid, el] of this.audioElements) {
-				el.play().then(() => {
-					if (pid === peerId) console.log(`[VoiceChat] remote audio playing after gesture (${pid})`);
-				}).catch(() => {});
+			for (const [, el] of this.audioElements) {
+				el.play().catch(() => {});
 			}
 		};
 		document.addEventListener('touchstart', this.audioUnlockBound, { once: true, passive: true });
@@ -378,15 +355,11 @@ export class VoiceChat {
 		if (!this.audioCtx || this.audioCtx.state === 'closed') {
 			try {
 				this.audioCtx = new (window.AudioContext || window.webkitAudioContext)();
-			} catch (e) {
-				console.warn('[VoiceChat] AudioContext unavailable:', e && e.name);
-				return;
-			}
+			} catch (e) { /* AudioContext 不可用时仅依赖 <audio> 元素 */ return; }
 		}
 		if (this.audioCtx.state === 'suspended') {
 			this.audioCtx.resume().catch(() => {});
 		}
-		console.log(`[VoiceChat] audio ctx state=${this.audioCtx.state}`);
 	}
 
 	removeAudioElement(peerId) {
@@ -401,10 +374,10 @@ export class VoiceChat {
 			try { source.disconnect(); } catch (e) { /* ignore */ }
 			this.audioSources.delete(peerId);
 		}
-		const hintTimer = this.statsTimers.get(peerId);
+		const hintTimer = this.hintTimers.get(peerId);
 		if (hintTimer) {
 			clearTimeout(hintTimer);
-			this.statsTimers.delete(peerId);
+			this.hintTimers.delete(peerId);
 		}
 	}
 
@@ -602,10 +575,10 @@ export class VoiceChat {
 			try { source.disconnect(); } catch (e) { /* ignore */ }
 		}
 		this.audioSources.clear();
-		for (const [, timer] of this.statsTimers) {
+		for (const [, timer] of this.hintTimers) {
 			clearTimeout(timer);
 		}
-		this.statsTimers.clear();
+		this.hintTimers.clear();
 		if (this.audioUnlockBound) {
 			this.audioUnlockBound = null;
 		}

@@ -73,6 +73,65 @@ class NodeCrypt {
 		// uniapp APP 外壳的推送设备标识（URL 传入,用于离线推送注册）
 		// Push token of the uniapp APP shell (passed via URL, used for offline push registration)
 		this.pushToken = (typeof window !== 'undefined' && typeof window.nativePushToken === 'string' && window.nativePushToken) || null;
+		// 每次连接会话的注册状态与 cid 迟到重试计时器（cid 可能晚于页面加载到来）
+		// Per-session registration state and late-cid retry timer (cid may arrive after page load)
+		this.pushTokenRegistered = null;
+		this.pushTokenRetryTimer = null;
+	}
+
+	// 注册离线推送设备：cid 已知且加密通道就绪时上送，幂等；返回是否执行了一次注册
+	// Register offline push device: upload when both cid and secure channel ready; idempotent
+	registerPushToken() {
+		const token = (typeof window !== 'undefined' && typeof window.nativePushToken === 'string' && window.nativePushToken) || null;
+		if (!token || !this.serverShared || this.pushTokenRegistered === token) {
+			return false;
+		}
+		this.pushToken = token;
+		this.pushTokenRegistered = token;
+		try {
+			this.sendMessage(this.encryptServerMessage({
+				a: 'dr',
+				p: token
+			}, this.serverShared));
+		} catch (error) {
+			this.logEvent('push-token-register', error, 'error');
+			this.pushTokenRegistered = null;
+			return false;
+		}
+		return true;
+	}
+
+	// cid 迟到补注册：加入服务器后轮询 window.nativePushToken 最多 30 秒
+	// Late-cid registration: poll window.nativePushToken for up to 30s after joining
+	armPushTokenRetry() {
+		if (this.pushTokenRetryTimer) {
+			return;
+		}
+		const startedAt = Date.now();
+		this.pushTokenRetryTimer = setInterval(() => {
+			try {
+				this.registerPushToken();
+				const tokenNow = (typeof window !== 'undefined' && typeof window.nativePushToken === 'string' && window.nativePushToken) || null;
+				const registered = tokenNow && this.pushTokenRegistered === tokenNow;
+				if (registered || Date.now() - startedAt > 30000) {
+					clearInterval(this.pushTokenRetryTimer);
+					this.pushTokenRetryTimer = null;
+				}
+			} catch (error) {
+				this.logEvent('push-token-retry', error, 'error');
+			}
+		}, 2000);
+	}
+
+	// 服务器通道建立时调用：先重置会话级注册状态（保证重连后重新上送），再注册
+	// Called when the secure channel is established: reset session state (re-register after reconnects)
+	initPushTokenRegistration() {
+		this.pushTokenRegistered = null;
+		if (this.registerPushToken() && this.pushTokenRetryTimer) {
+			clearInterval(this.pushTokenRetryTimer);
+			this.pushTokenRetryTimer = null;
+		}
+		this.armPushTokenRetry();
 	}
 
 	// Set user credentials (username, channel, password)
@@ -224,12 +283,7 @@ class NodeCrypt {
 					}, this.serverShared));
 					// 向服务器注册离线推送设备（加密通道内,服务器只知道房间哈希）
 					// Register offline push device (inside the encrypted channel, server only knows the room hash)
-					if (this.pushToken) {
-						this.sendMessage(this.encryptServerMessage({
-							a: 'dr',
-							p: this.pushToken
-						}, this.serverShared));
-					}
+					this.initPushTokenRegistration();
 					if (this.callbacks.onServerSecured) {
 						try {
 							this.callbacks.onServerSecured()
