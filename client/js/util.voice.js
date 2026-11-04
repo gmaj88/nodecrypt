@@ -160,40 +160,25 @@ export class VoiceChat {
 			return;
 		}
 
-		// 预检输入设备：枚举结果非空且完全没有音频输入时才进入仅听模式
-		// （WebView 常返回空列表/空 deviceId，不代表无麦克风，应照常尝试采集）
-		// Pre-check: enter listen-only only when enumeration is non-empty yet has zero audio inputs;
-		// WebView often returns empty lists / blank deviceIds, which does NOT mean no mic exists
-		let micAvailable = true;
+		// 不再依赖 enumerateDevices 预检（WebView 授权状态变化时会漏报 audioinput，
+		// 把有麦设备误判成无麦）。直接 getUserMedia 试采集——它才是权威判断：
+		// 真无麦 → NotFoundError；被拒 → NotAllowedError；其余失败照常进入仅听模式。
+		// Don't trust enumerateDevices pre-check (WebView auth-state changes make it
+		// under-report audioinput). getUserMedia is the ground truth: a real mic gets
+		// prompted/succeeds; true absence yields NotFoundError; denial NotAllowedError.
 		try {
-			if (navigator.mediaDevices && typeof navigator.mediaDevices.enumerateDevices === 'function') {
-				const devices = await navigator.mediaDevices.enumerateDevices();
-				micAvailable = devices.length > 0 && !devices.some((d) => d.kind === 'audioinput');
-			}
-		} catch (e) { /* 预检失败时按“可能有麦克风”处理 / fall back to assuming a mic exists */ }
-
-		if (!micAvailable) {
-			console.warn('[VoiceChat] no audio input device detected, entering listen-only mode');
-			addSystemMsg(t('voice.mic_not_found', 'No microphone detected on this device'));
+			this.localStream = await navigator.mediaDevices.getUserMedia({
+				audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
+				video: false
+			});
+			this.listenOnly = false;
+		} catch (e) {
+			// 麦克风不可用时不再退出，转为仅听模式继续加入，可正常听到其他人
+			// When mic is unavailable, don't bail out — join in listen-only mode and keep receiving others
+			console.error('[VoiceChat] getUserMedia failed:', e && e.name, e);
+			addSystemMsg(this.describeMicError(e));
 			addSystemMsg(t('voice.listen_only', 'No microphone — joining in listen-only mode, you can still hear others'));
 			this.listenOnly = true;
-		} else {
-			try {
-				this.localStream = await navigator.mediaDevices.getUserMedia({
-					audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
-					video: false
-				});
-				this.listenOnly = false;
-			} catch (e) {
-				// 输出具体错误类型（NotAllowed/NotFound/NotReadable 等）便于定位
-				// Log the concrete error name to help diagnosis
-				console.error('[VoiceChat] getUserMedia failed:', e && e.name, e);
-				// 麦克风不可用时不再退出，转为仅听模式继续加入，可正常听到其他人
-				// When mic is unavailable, don't bail out — join in listen-only mode and keep receiving others
-				addSystemMsg(this.describeMicError(e));
-				addSystemMsg(t('voice.listen_only', 'No microphone — joining in listen-only mode, you can still hear others'));
-				this.listenOnly = true;
-			}
 		}
 
 		try {
