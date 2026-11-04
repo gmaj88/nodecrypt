@@ -33,11 +33,11 @@ function requestId() {
 
 // 个推鉴权 token（缓存到 DO storage，避免每次请求重新签名）
 // Getui auth token (cached in DO storage to avoid re-signing every push)
-async function getGetuiToken(env, storage) {
+async function requestGetuiToken(env, storage) {
 	try {
 		const cached = await storage.get(tokenCacheKey(env.GETUI_APP_ID));
 		if (cached && cached.token && cached.exp > Date.now()) {
-			return cached.token;
+			return { token: cached.token, code: 0, msg: 'cached' };
 		}
 		const ts = timestamp();
 		const sign = await sha256Hex(`${env.GETUI_APP_KEY}${ts}${env.GETUI_MASTER_SECRET}`);
@@ -54,14 +54,19 @@ async function getGetuiToken(env, storage) {
 				token: json.data.token,
 				exp: Date.now() + 23 * 60 * 60 * 1000
 			});
-			return json.data.token;
+			return { token: json.data.token, code: 0, msg: null };
 		}
 		console.error('getui auth failed', json && json.msg);
-		return null;
+		return { token: null, code: json ? json.code : response.status, msg: json ? json.msg : `http ${response.status}` };
 	} catch (error) {
 		console.error('getui auth error', error);
-		return null;
+		return { token: null, code: null, msg: String(error && error.message || error) };
 	}
+}
+
+async function getGetuiToken(env, storage) {
+	const result = await requestGetuiToken(env, storage);
+	return result.token;
 }
 
 // 列出指定频道离线设备（state.storage 持久化，键: devices:{channelHash}）
@@ -236,11 +241,15 @@ export async function debugPush(env, storage, channelHash) {
 			devices: deviceList,
 			offlineTokens: offlineTokens.length,
 			auth: 'pending',
+			authCode: null,
+			authMsg: null,
 			pushResults: []
 		};
-		const token = await getGetuiToken(env, storage);
-		if (!token) {
+		const tokenInfo = await requestGetuiToken(env, storage);
+		if (!tokenInfo.token) {
 			result.auth = 'failed';
+			result.authCode = tokenInfo.code;
+			result.authMsg = tokenInfo.msg;
 			return result;
 		}
 		result.auth = 'ok';
@@ -249,7 +258,7 @@ export async function debugPush(env, storage, channelHash) {
 			try {
 				const response = await fetch(`${GETUI_REST_BASE}/${env.GETUI_APP_ID}/push/single/cid`, {
 					method: 'POST',
-					headers: { 'Content-Type': 'application/json', 'token': token },
+					headers: { 'Content-Type': 'application/json', 'token': tokenInfo.token },
 					body: JSON.stringify({
 						request_id: requestId(),
 						settings: { ttl: 3600000 },
