@@ -44,7 +44,8 @@ async function requestGetuiToken(env, storage) {
 		const response = await fetch(`${GETUI_REST_BASE}/${env.GETUI_APP_ID}/auth`, {
 			method: 'POST',
 			headers: { 'Content-Type': 'application/json' },
-			body: JSON.stringify({ sign: sign, timestamp: ts, appkey: env.GETUI_APP_KEY })
+			body: JSON.stringify({ sign: sign, timestamp: ts, appkey: env.GETUI_APP_KEY }),
+			signal: AbortSignal.timeout(10000)
 		});
 		const json = await response.json();
 		if (json && json.code === 0 && json.data && json.data.token) {
@@ -182,7 +183,8 @@ export async function notifyOfflineDevices(env, storage, channelHash) {
 								payload: payload
 							}
 						}
-					})
+					}),
+					signal: AbortSignal.timeout(10000)
 				});
 				const json = await response.json();
 				if (json && json.code !== 0) {
@@ -275,7 +277,8 @@ export async function debugPush(env, storage, channelHash) {
 								payload: payload
 							}
 						}
-					})
+					}),
+					signal: AbortSignal.timeout(10000)
 				});
 				let json = null;
 				try { json = await response.json(); } catch (e) { /* non-JSON response */ }
