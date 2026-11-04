@@ -214,7 +214,12 @@ export async function listAllDevices(storage) {
 export async function debugPush(env, storage, channelHash) {
 	try {
 		if (!isConfigured(env)) {
-			return { error: 'GETUI secrets not configured' };
+			const bindings = {
+				GETUI_APP_ID: typeof env.GETUI_APP_ID === 'string' && env.GETUI_APP_ID.length > 0,
+				GETUI_APP_KEY: typeof env.GETUI_APP_KEY === 'string' && env.GETUI_APP_KEY.length > 0,
+				GETUI_MASTER_SECRET: typeof env.GETUI_MASTER_SECRET === 'string' && env.GETUI_MASTER_SECRET.length > 0
+			};
+			return { error: 'GETUI secrets not configured', bindings };
 		}
 		const key = `devices:${channelHash}`;
 		const devices = (await storage.get(key)) || {};
