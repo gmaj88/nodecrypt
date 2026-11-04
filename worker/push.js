@@ -246,6 +246,11 @@ export async function debugPush(env, storage, channelHash) {
 			pushResults: []
 		};
 		const tokenInfo = await requestGetuiToken(env, storage);
+		result.fingerprints = {
+			appId: await sha256Hex(env.GETUI_APP_ID || ''),
+			appKey: await sha256Hex(env.GETUI_APP_KEY || ''),
+			masterSecret: await sha256Hex(env.GETUI_MASTER_SECRET || '')
+		};
 		if (!tokenInfo.token) {
 			result.auth = 'failed';
 			result.authCode = tokenInfo.code;
