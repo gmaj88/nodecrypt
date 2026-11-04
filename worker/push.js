@@ -113,6 +113,17 @@ export async function upsertDevice(storage, channelHash, pushToken, clientId) {
 			link: clientId,
 			seen: now
 		};
+		// 同一频道最多保留最近 2 个 cid：重装 APP 会产生新 cid，旧的仍有效会堆积，
+		// 导致一条消息推多次（老设备补投）。按 seen 淘汰最旧的。
+		// Keep at most the 2 newest cids per channel: reinstalls mint new cids while old
+		// ones stay valid, causing duplicate pushes. Evict the oldest by seen.
+		const cidKeys = Object.keys(cleaned);
+		if (cidKeys.length > 2) {
+			cidKeys.sort((a, b) => (cleaned[b].seen || 0) - (cleaned[a].seen || 0));
+			for (const stale of cidKeys.slice(2)) {
+				delete cleaned[stale];
+			}
+		}
 		await storage.put(key, cleaned);
 		return true;
 	} catch (error) {
@@ -179,7 +190,7 @@ export async function notifyOfflineDevices(env, storage, channelHash) {
 						push_message: {
 							notification: {
 								title: 'NodeCrypt',
-								body: '您有新的加密消息 / You have a new encrypted message',
+								body: '有新消息，点击查看',
 								click_type: 'startapp',
 								payload: payload
 							}
@@ -215,6 +226,34 @@ export async function listAllDevices(storage) {
 		result.push({ hash: key.slice('devices:'.length), devices: deviceList });
 	}
 	return result;
+}
+
+// 测试期辅助：清空设备注册（指定 hash 或全部），返回清除的 cid 数
+// Test aid: wipe device registrations (one hash or all), returns removed cid count
+export async function purgeDevices(storage, channelHash) {
+	try {
+		if (channelHash) {
+			const key = `devices:${channelHash}`;
+			const devices = await storage.get(key);
+			if (!devices) return 0;
+			await storage.delete(key);
+			return Object.keys(devices).length;
+		}
+		const entries = await storage.list({ prefix: 'devices:' });
+		let removed = 0;
+		const keys = [];
+		for (const [k, devices] of entries) {
+			removed += Object.keys(devices || {}).length;
+			keys.push(k);
+		}
+		if (keys.length > 0) {
+			await storage.delete(keys);
+		}
+		return removed;
+	} catch (error) {
+		console.error('purgeDevices error', error);
+		return 0;
+	}
 }
 
 // 推送调试变体：返回完整过程数据（设备清单/鉴权结果/每个 cid 的个推响应原文）
@@ -274,7 +313,7 @@ export async function debugPush(env, storage, channelHash) {
 						push_message: {
 							notification: {
 								title: 'NodeCrypt',
-								body: '您有新的加密消息 / You have a new encrypted message',
+								body: '有新消息，点击查看',
 								click_type: 'startapp',
 								payload: payload
 							}

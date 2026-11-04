@@ -1,5 +1,5 @@
 import { generateClientId, encryptMessage, decryptMessage, logEvent, isString, isObject, getTime } from './utils.js';
-import { upsertDevice, markDeviceOffline, notifyOfflineDevices, listAllDevices, debugPush } from './push.js';
+import { upsertDevice, markDeviceOffline, notifyOfflineDevices, listAllDevices, purgeDevices, debugPush } from './push.js';
 import { getVoiceTurnIceServers } from './voiceTurn.js';
 
 export default {
@@ -135,6 +135,12 @@ export class ChatRoom {  constructor(state, env) {
       try {
         const params = url.searchParams;
         const hash = params.get('hash');
+        if (params.get('purge') === '1') {
+          // 测试期辅助：清空指定（或全部）hash 的设备注册，清除重装残留 cid
+          // Test aid: wipe device registrations for a hash (or all) to clear stale reinstall cids
+          const deleted = await purgeDevices(this.state.storage, hash);
+          return new Response(JSON.stringify({ purged: true, hash: hash || 'all', removed: deleted }), { headers: { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' } });
+        }
         if (hash) {
           const data = params.get('push') === '1'
             ? await debugPush(this.env, this.state.storage, hash)
