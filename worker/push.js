@@ -174,6 +174,7 @@ export async function notifyOfflineDevices(env, storage, channelHash) {
 					},
 					body: JSON.stringify({
 						request_id: requestId(),
+						audience: { cid: [cid] },
 						settings: { ttl: 3600000 },
 						push_message: {
 							notification: {
@@ -268,6 +269,7 @@ export async function debugPush(env, storage, channelHash) {
 					headers: { 'Content-Type': 'application/json', 'token': tokenInfo.token },
 					body: JSON.stringify({
 						request_id: requestId(),
+						audience: { cid: [cid] },
 						settings: { ttl: 3600000 },
 						push_message: {
 							notification: {
