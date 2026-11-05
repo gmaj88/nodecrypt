@@ -199,10 +199,10 @@ function buildVendorNotification(env, payloadText) {
 // strategy 4 = prefer vendor channels, fall back to the Getui channel on failure
 // (queued in Getui's offline store and redelivered when the app opens) - the failure
 // fallback happens atomically inside Getui, one message is never double-sent.
-function buildPushBody(env, channelHash, audienceCid) {
+function buildPushBody(env, channelHash, audienceCid, testMessage) {
 	const payloadText = channelHash;
 	const vendorNotification = buildVendorNotification(env, payloadText);
-	return {
+	const body = {
 		request_id: requestId(),
 		audience: { cid: [audienceCid] },
 		settings: { ttl: 3600000, strategy: { default: 4 } },
@@ -221,10 +221,15 @@ function buildPushBody(env, channelHash, audienceCid) {
 						title: NOTIFY_TITLE,
 						body: NOTIFY_BODY
 					}, vendorNotification),
-					// 华为桌面角标 +1（客户端进房间/回首页时会清零或重算）
-					// Huawei launcher badge +1 (client clears/recomputes it when entering a room / home)
+					// 华为通知自分类权益：服务端必须携带 category（"即时聊天"=IM）才会按
+					// 服务与通讯类计（推送数量不受 2 条/日/设备 的资讯营销类频控）；
+					// 权益审核通过但消息不带 category 时仍按营销类频控。
+					// Huawei self-classification right: the message MUST carry category
+					// ("im" scenario = IM), otherwise it falls back to the marketing class
+					// with a 2/day/device rate limit even after the right is approved.
 					options: {
 						HW: {
+							'/message/android/notification/category': hwCategory(env),
 							'/message/android/notification/badge/class': 'io.dcloud.PandoraEntry',
 							'/message/android/notification/badge/add_num': 1
 						}
@@ -242,6 +247,22 @@ function buildPushBody(env, channelHash, audienceCid) {
 			}
 		}
 	};
+	if (testMessage) {
+		// 厂商测试通道标记：华为调测阶段每应用每日 1000 条测试消息，不占 2 条/日 额度；
+		// 仅用于诊断端点（?push=1&test=1），正式推送绝不携带此标记。
+		// Vendor test-message flag: Huawei allows 1000/day app-wide test messages in the
+		// debug phase (does not consume the 2/day quota). Only used by the diagnostic
+		// endpoint (?push=1&test=1); production pushes must never carry this.
+		body.pushOptions = { testMessage: true };
+	}
+	return body;
+}
+
+// 华为自分类 category：默认 IM（即时聊天），可用环境变量 GETUI_HW_CATEGORY 覆盖
+// Huawei self-classification category: default IM (instant chat), overridable via env
+function hwCategory(env) {
+	const value = String(env.GETUI_HW_CATEGORY || '').trim();
+	return value || 'IM';
 }
 
 // 从个推返回 data 中提取指定 cid 的状态字符串（兼容二层/平铺结构）
@@ -384,7 +405,7 @@ export async function purgeDevices(storage, channelHash) {
 
 // 推送调试变体：返回完整过程数据（设备清单/鉴权结果/每个 cid 的个推响应原文）
 // Debug variant of push: full process data (device list / auth result / per-cid Getui response)
-export async function debugPush(env, storage, channelHash) {
+export async function debugPush(env, storage, channelHash, testMessage) {
 	try {
 		if (!isConfigured(env)) {
 			const bindings = {
@@ -420,6 +441,8 @@ export async function debugPush(env, storage, channelHash) {
 			masterSecret: await sha256Hex(env.GETUI_MASTER_SECRET || '')
 		};
 		result.androidPackage = String(env.GETUI_ANDROID_PACKAGE || '').trim() || '(unset)';
+		result.hwCategory = hwCategory(env);
+		result.testMessage = testMessage ? true : false;
 		result.vendorBody = buildVendorNotification(env, channelHash);
 		if (!tokenInfo.token) {
 			result.auth = 'failed';
@@ -430,7 +453,7 @@ export async function debugPush(env, storage, channelHash) {
 		result.auth = 'ok';
 		for (const cid of offlineTokens) {
 			try {
-				const vendorBody = buildPushBody(env, channelHash, cid);
+				const vendorBody = buildPushBody(env, channelHash, cid, testMessage);
 				const json = await postGetui(env, tokenInfo.token, cid, vendorBody);
 				const delivered = vendorDelivered(json, cid);
 				result.pushResults.push({

@@ -62,6 +62,7 @@ uniapp/
 ### 4.2 必配 Secrets（Cloudflare Worker "nodecrypt"）
 - `GETUI_APP_ID` / `GETUI_APP_KEY` / `GETUI_MASTER_SECRET` —— 个推开发者中心
 - `GETUI_ANDROID_PACKAGE` —— Android 包名（当前 `uni.app.UNI8357253`）。用于拼厂商点击 intent；**缺失时厂商通知点击只能"打开首页"，无法直达房间**。
+- `GETUI_HW_CATEGORY`（可选）—— 华为通知自分类 category，默认 `IM`（即时聊天）
 
 设置方式：`echo <值> | npx wrangler secret put <名称>`（或 dashboard）。设置后立即生效。
 
@@ -74,7 +75,9 @@ uniapp/
 6. 手机端 HMS Core 较新 + 通知权限（含"营销通知"）开启。
 
 ### 4.4 额度与限制
-- 厂商公信消息 **约 2 条/日/设备**（华为未申请"自分类权益"时）。测试推送会消耗额度，一天别超测。
+- 厂商公信消息 **约 2 条/日/设备**（华为"资讯营销类"频控）。
+- **华为通知自分类权益申请通过 ≠ 额度自动生效**：必须推送消息携带 `category: "IM"`（"即时聊天"场景），才按"服务与通讯类"计（数量不受限）。已在服务端 HW options 携带（缺省 IM，可用 `GETUI_HW_CATEGORY` 覆盖）。
+- 诊断端点可用 `?push=1&test=1` 携带 `pushOptions.testMessage: true` 走**华为测试通道**（每应用每日 1000 条，不占正式额度，仅测试用途，正式推送绝不携带）。
 - 额度耗尽或厂商拒绝时：策略 4 自动退回个推离线库 → **表现为"打开 APP 才收到"**，注意别把它误判为"厂商通道没配通"。
 - 判断厂商通道是否真通，看 `/api/push-test` 返回的 `status: "successed_offline"`（嵌套结构 `data[taskId][cid]`）。
 
@@ -82,7 +85,9 @@ uniapp/
 - `GET /api/push-test` —— 列出所有已注册频道 hash 与设备；
 - `GET /api/push-test?hash=<hash>` —— 单频道设备列表；
 - `GET /api/push-test?hash=<hash>&purge=1` —— 清空该频道（或不带 hash 清全部）设备注册（清残留重装 cid）；
-- `GET /api/push-test?hash=<hash>&push=1` —— **真实下发测试推送**并返回全过程：设备列表、个推鉴权、每个 cid 的 `code/msg/status/delivered/raw/body`、`androidPackage`、`vendorBody`。
+- `GET /api/push-test?hash=<hash>&push=1` —— **真实下发测试推送**并返回全过程：设备列表、个推鉴权、每个 cid 的 `code/msg/status/delivered/raw/body`、`androidPackage`、`hwCategory`、`vendorBody`；
+- `GET /api/push-test?hash=<hash>&push=1&test=1` —— 同上，但走华为**测试通道**（testMessage，不占正式额度）。
+- AGC 后台无法直接对设备发"测试消息"（面向 token 的运营推送需要 device token，uniapp 应用不便提取）；验证厂商链路用 push-test 端点即可（等价个推单推→华为）。
 
 ## 5. 语音通话
 
@@ -120,6 +125,7 @@ localStorage.removeItem('nodecrypt-debug');     // 关（默认）
 | 杀进程收不到推送 | 个推单推未带 `push_channel` + 厂商通道未配 | 服务端补 push_channel + DCloud 后台配华为厂商 |
 | 点击通知不进房 | 厂商通道 `click_type: startapp` 且缺包名 | 改为 `intent` + `GETUI_ANDROID_PACKAGE` secret |
 | 重复推送/误判失败 | 解析个推返回嵌套结构错误 + 手工兜底双发 | 修 nested 解析 + 个推策略 4 原生兜底 |
+| 华为自分类权益通过仍被 2 条/日 频控 | 推送未携带 category 字段 | 服务端 HW options 携带 `notification/category: IM` |
 | APP 语音无声 | Android WebView 播放/采集链路 | 反射放开 autoplay + 手势解锁 AudioContext + 双通道播放 |
 | 语音音量小 | WebRTC 走通话音量通道 | 面板 ×1/×1.8/×3 增益按钮 + 提醒通话音量条 |
 | 控制台刷屏（INFO 密文/解密内容） | `main.js` 里 `debug: true` 硬编码 | 改为 `localStorage` 开关，默认关 |

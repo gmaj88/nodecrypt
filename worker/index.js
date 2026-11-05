@@ -143,7 +143,7 @@ export class ChatRoom {  constructor(state, env) {
         }
         if (hash) {
           const data = params.get('push') === '1'
-            ? await debugPush(this.env, this.state.storage, hash)
+            ? await debugPush(this.env, this.state.storage, hash, params.get('test') === '1')
             : { channelHash: hash, note: 'add &push=1 to send a test push' };
           return new Response(JSON.stringify(data), { headers: { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' } });
         }
