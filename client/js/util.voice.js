@@ -304,6 +304,7 @@ export class VoiceChat {
 		}
 
 		pc.ontrack = (event) => {
+			addSystemMsg(t('voice.remote_stream', 'Remote audio stream received — waiting for connection...'));
 			if (event.streams && event.streams[0]) {
 				this.setupAudioElement(peerId, event.streams[0]);
 			}
@@ -324,6 +325,7 @@ export class VoiceChat {
 				this.handlePeerDisconnected(peerId);
 			} else if (state === 'connected') {
 				this.clearFault('ice');
+				addSystemMsg(t('voice.peer_connected', 'Voice connection established'));
 				this.updateVoiceUI(true);
 			}
 		};
@@ -353,6 +355,7 @@ export class VoiceChat {
 
 		audio.play().then(() => {
 			this.clearFault('play');
+			addSystemMsg(t('voice.remote_playing', 'Remote audio element playing'));
 		}).catch(() => {
 			// 元素播放被拦截（自动播放策略）时，一次手势后重试
 			// When element playback is blocked by autoplay policy, retry after a gesture
