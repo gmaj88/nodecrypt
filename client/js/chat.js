@@ -27,6 +27,21 @@ import {
 	t
 } from './util.i18n.js';
 
+// 滚动到底合并调度：同一帧内多条消息只做一次强制布局
+// （每条消息都直接 scrollTop = scrollHeight 会各触发一次同步 reflow，
+// 低端手机 webview 上消息密集时会造成明显掉帧、点按无响应）
+// Batch scroll-to-bottom into one layout per frame: assigning scrollTop directly on
+// every message forces a synchronous reflow each time, which visibly drops frames on
+// low-end phone webviews when messages arrive in bursts
+let scrollRafId = 0;
+export function scheduleScrollToBottom(chatArea) {
+	if (scrollRafId) return;
+	scrollRafId = requestAnimationFrame(() => {
+		scrollRafId = 0;
+		chatArea.scrollTop = chatArea.scrollHeight;
+	});
+}
+
 // Render the chat area
 // 渲染聊天区域
 export function renderChatArea() {
@@ -114,7 +129,7 @@ export function addMsg(text, isHistory = false, msgType = 'text', timestamp = nu
 		class: className
 	}, `<span class="bubble-content">${contentHtml}</span><span class="bubble-meta">${time}</span>`);
 	chatArea.appendChild(div);
-	chatArea.scrollTop = chatArea.scrollHeight
+	scheduleScrollToBottom(chatArea)
 }
 
 // Add a message from another user to the chat area
@@ -198,10 +213,10 @@ export function addOtherMsg(msg, userName = '', avatar = '', isHistory = false, 
 	const avatarEl = $('.avatar', bubbleWrap);
 	if (avatarEl) {
 		const cleanSvg = svg.replace(/<script\b[^<]*(?:(?!<\/script>)<[^<]*)*<\/script>/gi, '');
-		avatarEl.innerHTML = cleanSvg
+		avatarEl.innerHTML = cleanSvg;
 	}
 	chatArea.appendChild(bubbleWrap);
-	chatArea.scrollTop = chatArea.scrollHeight
+	scheduleScrollToBottom(chatArea);
 }
 
 // Add a system message to the chat area
@@ -222,7 +237,7 @@ export function addSystemMsg(text, isHistory = false, timestamp = null) {
 		class: 'bubble system'
 	}, `<span class="bubble-content">${safeText}</span>`);
 	chatArea.appendChild(div);
-	chatArea.scrollTop = chatArea.scrollHeight
+	scheduleScrollToBottom(chatArea)
 }
 
 // Update the style of the chat input area

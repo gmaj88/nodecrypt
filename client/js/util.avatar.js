@@ -14,10 +14,21 @@ function pickColor(seed) {
 }
 // Create SVG avatar for user name
 // 为用户名生成 SVG 头像
+// 头像 SVG 缓存：同用户名只生成一次（dicebear 生成有一定 DOM/计算开销，
+// 每条消息都重建会在低端手机 webview 上放大 CPU 占用）
+// Avatar SVG cache: generate once per username (dicebear generation costs real
+// CPU-DOM work; recreating it for every message amplifies load on low-end webviews)
+const avatarCache = new Map();
 export function createAvatarSVG(userName) {
-	return dicebearCore.createAvatar(dicebearMicah, {
+	if (avatarCache.has(userName)) {
+		return avatarCache.get(userName);
+	}
+	const svg = dicebearCore.createAvatar(dicebearMicah, {
 		seed: userName,
 		baseColor: ["f7e1c3", "f9c9b6", "f2d6cb", "f8ce8e", "eac393"],
 		backgroundColor: [pickColor(userName)]
-	}).toString()
+	}).toString();
+	if (avatarCache.size > 300) avatarCache.clear();
+	avatarCache.set(userName, svg);
+	return svg;
 }
