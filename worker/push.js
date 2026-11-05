@@ -178,7 +178,7 @@ function buildVendorNotification(env, payloadText) {
 		if (!pkg) {
 			// 未配置包名：退化为打开应用首页（点击后 payload 可能丢失，仅能进 APP）
 			// Package name missing: fall back to launch home (payload may be lost on click)
-			return { click_type: 'startapp', payload: payloadText };
+			return { click_type: 'startapp' };
 		}
 		return {
 			click_type: 'intent',
@@ -188,19 +188,24 @@ function buildVendorNotification(env, payloadText) {
 				`S.title=${NOTIFY_TITLE};S.content=${NOTIFY_BODY};S.payload=${payloadText};end`
 		};
 	} catch (error) {
-		return { click_type: 'startapp', payload: payloadText };
+		return { click_type: 'startapp' };
 	}
 }
 
 // 组装一次 cid 单推的完整请求体（在线个推通道 + 离线厂商通道）
 // Assemble one single-cid push body (online Getui channel + offline vendor channel)
+// strategy.default = 4：厂商通道优先，失败自动回退个推通道（失败时的消息存个推离线库，
+// APP 打开补投）——服务端原生完成失败兜底，单条消息不会重复下发。
+// strategy 4 = prefer vendor channels, fall back to the Getui channel on failure
+// (queued in Getui's offline store and redelivered when the app opens) - the failure
+// fallback happens atomically inside Getui, one message is never double-sent.
 function buildPushBody(env, channelHash, audienceCid) {
 	const payloadText = channelHash;
 	const vendorNotification = buildVendorNotification(env, payloadText);
 	return {
 		request_id: requestId(),
 		audience: { cid: [audienceCid] },
-		settings: { ttl: 3600000 },
+		settings: { ttl: 3600000, strategy: { default: 4 } },
 		push_message: {
 			notification: {
 				title: NOTIFY_TITLE,
@@ -239,6 +244,66 @@ function buildPushBody(env, channelHash, audienceCid) {
 	};
 }
 
+// 从个推返回 data 中提取指定 cid 的状态字符串（兼容二层/平铺结构）
+// Extract the status string for a cid from the response data (nested or flat)
+function vendorStatus(json, cid) {
+	try {
+		if (!json || !json.data || typeof json.data !== 'object') return null;
+		if (Object.prototype.hasOwnProperty.call(json.data, cid)) {
+			return typeof json.data[cid] === 'string' ? json.data[cid] : null;
+		}
+		for (const key in json.data) {
+			const value = json.data[key];
+			if (value && typeof value === 'object' && Object.prototype.hasOwnProperty.call(value, cid)) {
+				return typeof value[cid] === 'string' ? value[cid] : null;
+			}
+		}
+		return null;
+	} catch (error) {
+		return null;
+	}
+}
+
+// 个推单推返回的 data 实际为 { taskId: { cid: 状态 } } 二层结构，
+// successed_offline=厂商/离线下发成功，successed_online=个推通道在线送达；
+// 兼容文档中历史的平铺 { cid: 状态 } 形态。successed_ignore=90 天不活跃未下发（ cid 已失效）。
+// Getui returns data as { taskId: { cid: status } } (docs), with a legacy flat
+// { cid: status } shape also handled. ignore = cid inactive for 90 days (stale).
+function vendorDelivered(json, cid) {
+	try {
+		if (!json || json.code !== 0 || !json.data) return false;
+		if (typeof json.data === 'string') return json.data.length > 0;
+		for (const key in json.data) {
+			const value = json.data[key];
+			if (Object.prototype.hasOwnProperty.call(value, cid)) {
+				const status = value[cid];
+				return status === 'successed_offline' || status === 'successed_online';
+			}
+			if (key === cid) {
+				return value === 'successed_offline' || value === 'successed_online';
+			}
+		}
+		return false;
+	} catch (error) {
+		return false;
+	}
+}
+
+async function postGetui(env, token, cid, body) {
+	const response = await fetch(`${GETUI_REST_BASE}/${env.GETUI_APP_ID}/push/single/cid`, {
+		method: 'POST',
+		headers: {
+			'Content-Type': 'application/json',
+			'token': token
+		},
+		body: JSON.stringify(body),
+		signal: AbortSignal.timeout(10000)
+	});
+	let json = null;
+	try { json = await response.json(); } catch (error) { /* non-JSON response */ }
+	return json;
+}
+
 // 推送通知（不 await 结果也安全；由 DO 的 await 链路保证调度）
 // Send push notifications (safe fire-and-forget; scheduled via DO await chain)
 export async function notifyOfflineDevices(env, storage, channelHash) {
@@ -256,18 +321,12 @@ export async function notifyOfflineDevices(env, storage, channelHash) {
 		}
 		for (const cid of tokens) {
 			try {
-				const response = await fetch(`${GETUI_REST_BASE}/${env.GETUI_APP_ID}/push/single/cid`, {
-					method: 'POST',
-					headers: {
-						'Content-Type': 'application/json',
-						'token': token
-					},
-					body: JSON.stringify(buildPushBody(env, channelHash, cid)),
-					signal: AbortSignal.timeout(10000)
-				});
-				const json = await response.json();
-				if (json && json.code !== 0) {
-					console.error('getui push failed', cid, json && json.msg);
+				// 策略 4：厂商离线通道优先，失败由个推自动落回个推离线库（打开 APP 补投）
+				// Strategy 4: vendor channel first, Getui auto-falls back to its offline
+				// store (redelivered when the app opens) if the vendor send fails.
+				const json = await postGetui(env, token, cid, buildPushBody(env, channelHash, cid));
+				if (!vendorDelivered(json, cid)) {
+					console.error('getui push not confirmed', cid, json && json.msg, json && JSON.stringify(json.data || json));
 				}
 			} catch (error) {
 				console.error('getui push error', cid, error);
@@ -360,6 +419,8 @@ export async function debugPush(env, storage, channelHash) {
 			appKey: await sha256Hex(env.GETUI_APP_KEY || ''),
 			masterSecret: await sha256Hex(env.GETUI_MASTER_SECRET || '')
 		};
+		result.androidPackage = String(env.GETUI_ANDROID_PACKAGE || '').trim() || '(unset)';
+		result.vendorBody = buildVendorNotification(env, channelHash);
 		if (!tokenInfo.token) {
 			result.auth = 'failed';
 			result.authCode = tokenInfo.code;
@@ -369,15 +430,18 @@ export async function debugPush(env, storage, channelHash) {
 		result.auth = 'ok';
 		for (const cid of offlineTokens) {
 			try {
-				const response = await fetch(`${GETUI_REST_BASE}/${env.GETUI_APP_ID}/push/single/cid`, {
-					method: 'POST',
-					headers: { 'Content-Type': 'application/json', 'token': tokenInfo.token },
-					body: JSON.stringify(buildPushBody(env, channelHash, cid)),
-					signal: AbortSignal.timeout(10000)
+				const vendorBody = buildPushBody(env, channelHash, cid);
+				const json = await postGetui(env, tokenInfo.token, cid, vendorBody);
+				const delivered = vendorDelivered(json, cid);
+				result.pushResults.push({
+					cid,
+					code: json ? json.code : null,
+					msg: json ? json.msg : null,
+					status: vendorStatus(json, cid),
+					delivered,
+					raw: json ? JSON.stringify(json).slice(0, 600) : null,
+					body: JSON.stringify(vendorBody).slice(0, 600)
 				});
-				let json = null;
-				try { json = await response.json(); } catch (e) { /* non-JSON response */ }
-				result.pushResults.push({ cid, http: response.status, code: json ? json.code : null, msg: json ? json.msg : null });
 			} catch (error) {
 				result.pushResults.push({ cid, error: String(error && error.message || error) });
 			}
