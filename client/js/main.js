@@ -90,10 +90,20 @@ import {
 
 // 设置全局配置参数
 // Set global configuration parameters
+// debug 默认关闭（控制台不再输出加密消息等 INFO 日志）；
+// 需要调试时在浏览器控制台执行 localStorage.setItem('nodecrypt-debug','1') 后刷新即可
+// debug is off by default (no INFO dumps like decrypted messages in the console);
+// to debug, run localStorage.setItem('nodecrypt-debug','1') in the console and reload
 window.config = {
 	wsAddress: `${window.location.protocol === 'https:' ? 'wss:' : 'ws:'}//${window.location.host}`, // WebSocket 服务器地址 / WebSocket server address
 	//wsAddress: `wss://crypt.works`,
-	debug: true                       // 是否开启调试模式 / Enable debug mode
+	debug: (() => {
+		try {
+			return typeof localStorage !== 'undefined' && localStorage.getItem('nodecrypt-debug') === '1';
+		} catch (e) {
+			return false;
+		}
+	})()                              // 是否开启调试模式 / Enable debug mode
 };
 
 // 初始化 uniapp 原生外壳桥接（APP 内运行时生效，自动读取 URL 中的 pushCid）
