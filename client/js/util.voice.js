@@ -26,6 +26,7 @@ export class VoiceChat {
 		this.timerInterval = null;
 		this.pendingCandidates = new Map();
 		this.activeCallers = new Set();
+		this.faults = new Map();
 		this.audioCtx = null;
 		// WebAudio 兜底路由：WebView 中 <audio> 播放可能被自动播放策略拦截，
 		// 远端流经 WebAudio 输出可绕开该限制（走媒体音量流）
@@ -70,9 +71,16 @@ export class VoiceChat {
 							const data = await response.json();
 							if (data && Array.isArray(data.iceServers) && data.iceServers.length > 0) {
 								this.iceServers = data.iceServers;
+								this.clearFault('turn');
+							} else {
+								this.reportFault('turn', 'TURN response has empty iceServers (STUN only)');
 							}
+						} else {
+							this.reportFault('turn', `TURN config HTTP ${response.status} — STUN only`);
 						}
-					} catch (e) { /* 保持 STUN 兜底 / keep STUN fallback */ }
+					} catch (e) {
+						this.reportFault('turn', `TURN config fetch failed: ${e && e.message || e}`);
+					}
 				})();
 			}
 			this.turnPromise.finally(() => { this.turnLoaded = true; });
@@ -82,6 +90,54 @@ export class VoiceChat {
 
 	// 将 getUserMedia 错误类型映射为可读提示，避免一律报"被拒绝"
 	// Map getUserMedia error types to readable messages instead of one generic "denied"
+	// 故障可视化：把语音链路上每个失败步骤（麦克风/TURN/建联/播放）显示为通话面板里的红字，
+	// 避免浏览器 console 之外无处可看的静默失败，现场排查无需连电脑
+	// Visible fault banner: render every failed step (mic/TURN/connection/playback) as red
+	// text inside the call panel, instead of failing silently with only console output
+	reportFault(kind, detail) {
+		try {
+			this.faults.set(kind, String(detail || '').slice(0, 300));
+			const panel = $id('voice-call-panel');
+			if (!panel) return;
+			let banner = $id('voice-fault-banner');
+			if (!banner) {
+				banner = document.createElement('div');
+				banner.id = 'voice-fault-banner';
+				banner.style.cssText = 'color:#e26d6d;font-size:11px;line-height:1.4;padding:0 10px;white-space:pre-wrap;width:100%;text-align:left;';
+				panel.appendChild(banner);
+			}
+			let lines = '';
+			for (const [k, v] of this.faults) {
+				lines += `[${k}] ${v}\n`;
+			}
+			banner.textContent = lines.trim();
+			banner.style.display = 'block';
+		} catch (e) { /* 诊断辅助，绝不影响通话流程 */ }
+	}
+
+	clearFault(kind) {
+		try {
+			if (kind) {
+				this.faults.delete(kind);
+			} else {
+				this.faults.clear();
+			}
+			const banner = $id('voice-fault-banner');
+			if (banner) {
+				if (this.faults.size === 0) {
+					banner.textContent = '';
+					banner.style.display = 'none';
+				} else {
+					let lines = '';
+					for (const [k, v] of this.faults) {
+						lines += `[${k}] ${v}\n`;
+					}
+					banner.textContent = lines.trim();
+				}
+			}
+		} catch (e) { /* ignore */ }
+	}
+
 	describeMicError(e) {
 		const name = e && e.name;
 		if (name === 'NotAllowedError' || name === 'SecurityError') {
@@ -172,10 +228,13 @@ export class VoiceChat {
 				video: false
 			});
 			this.listenOnly = false;
+			this.clearFault('mic');
 		} catch (e) {
 			// 麦克风不可用时不再退出，转为仅听模式继续加入，可正常听到其他人
 			// When mic is unavailable, don't bail out — join in listen-only mode and keep receiving others
 			console.error('[VoiceChat] getUserMedia failed:', e && e.name, e);
+			const micDetail = `${e && e.name || 'error'}${e && e.message ? ': ' + e.message : ''}`;
+			this.reportFault('mic', micDetail);
 			addSystemMsg(this.describeMicError(e));
 			addSystemMsg(t('voice.listen_only', 'No microphone — joining in listen-only mode, you can still hear others'));
 			this.listenOnly = true;
@@ -217,8 +276,10 @@ export class VoiceChat {
 			this.sendVoiceSignalingTo(peerId, 'voice-offer', {
 				sdp: pc.localDescription.toJSON()
 			});
+			this.clearFault('offer');
 		} catch (e) {
 			console.error('[VoiceChat] create offer error:', e);
+			this.reportFault('offer', `${e && e.name || 'error'}${e && e.message ? ': ' + e.message : ''}`);
 			this.closePeerConnection(peerId);
 		}
 	}
@@ -259,8 +320,10 @@ export class VoiceChat {
 		pc.onconnectionstatechange = () => {
 			const state = pc.connectionState;
 			if (state === 'failed' || state === 'closed') {
+				this.reportFault('ice', `connection ${state} (peer ${peerId})`);
 				this.handlePeerDisconnected(peerId);
 			} else if (state === 'connected') {
+				this.clearFault('ice');
 				this.updateVoiceUI(true);
 			}
 		};
@@ -288,11 +351,18 @@ export class VoiceChat {
 		document.body.appendChild(audio);
 		this.audioElements.set(peerId, audio);
 
-		audio.play().catch(() => {
+		audio.play().then(() => {
+			this.clearFault('play');
+		}).catch(() => {
 			// 元素播放被拦截（自动播放策略）时，一次手势后重试
 			// When element playback is blocked by autoplay policy, retry after a gesture
+			this.reportFault('play', 'remote audio autoplay blocked — tap the screen once');
 			this.armUnlockRetry();
 		});
+
+		// 真正开始播放（含手势解锁重试成功）时清掉播放故障标记
+		// Clear the playback fault flag once playback actually starts (incl. retry success)
+		audio.addEventListener('playing', () => this.clearFault('play'));
 
 		// WebAudio 兜底：媒体音量流 + 独立于 <audio> 的播放 sink
 		// WebAudio fallback: media-volume stream and an independent playback sink
@@ -571,6 +641,7 @@ export class VoiceChat {
 		this.listenOnly = false;
 		this.isInCall = false;
 		this.callStartTime = null;
+		this.clearFault();
 		this.stopTimer();
 		this.updateVoiceUI(false);
 		this.updateCallIndicator();
