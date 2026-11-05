@@ -310,6 +310,13 @@ window.addEventListener('DOMContentLoaded', () => {
 		});
 	}
 
+	const voiceBoostBtn = $id('voice-boost-btn');
+	if (voiceBoostBtn) {
+		voiceBoostBtn.addEventListener('click', () => {
+			voiceChat.togglePlaybackBoost();
+		});
+	}
+
 	const voiceLeaveBtn = $id('voice-leave-btn');
 	if (voiceLeaveBtn) {
 		voiceLeaveBtn.addEventListener('click', () => {

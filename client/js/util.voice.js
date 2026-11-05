@@ -35,6 +35,12 @@ export class VoiceChat {
 		this.audioSources = new Map();
 		this.hintTimers = new Map();
 		this.audioUnlockBound = null;
+		// 播放增益：Android WebView 的 WebRTC 音频走"通话音量"通道，链路偏小；
+		// 提供 ×1/×1.8/×3 三档软件增益（WebAudio 输出路径），通话中点按钮循环
+		// Playback boost: Android WebView WebRTC audio uses the call-volume stream which
+		// runs low; offer ×1/×1.8/×3 software gain (WebAudio output), toggled in-call
+		this.playbackBoost = 0;
+		this.playbackGain = null;
 		// ICE 服务器：默认 STUN，通话开始时尝试加载 TURN（蜂窝 NAT 兜底）
 		// ICE servers: STUN by default; TURN loaded at call start when available (cellular NAT fallback)
 		this.iceServers = ICE_SERVERS.slice();
@@ -367,12 +373,13 @@ export class VoiceChat {
 		// Clear the playback fault flag once playback actually starts (incl. retry success)
 		audio.addEventListener('playing', () => this.clearFault('play'));
 
-		// WebAudio 兜底：媒体音量流 + 独立于 <audio> 的播放 sink
-		// WebAudio fallback: media-volume stream and an independent playback sink
+		// WebAudio 兜底 + 增益：媒体音量流 经播放增益节点 输出（支持 ×1/×1.8/×3 放大）
+		// WebAudio fallback + boost: media-volume stream routed via the playback gain node
 		if (this.audioCtx && this.audioCtx.state !== 'closed') {
 			try {
 				const source = this.audioCtx.createMediaStreamSource(stream);
-				source.connect(this.audioCtx.destination);
+				const sink = this.getPlaybackGain();
+				source.connect(sink);
 				this.audioSources.set(peerId, source);
 			} catch (e) { /* WebAudio 不可用时仍依赖 <audio> 元素 */ }
 		}
@@ -417,6 +424,40 @@ export class VoiceChat {
 		}
 		if (this.audioCtx.state === 'suspended') {
 			this.audioCtx.resume().catch(() => {});
+		}
+	}
+
+	// 播放增益节点（惰性创建）；所有 WebAudio 远端源统一接到它，再进扬声器
+	// Playback gain node (lazy); every remote WebAudio source routes through it
+	getPlaybackGain() {
+		if (!this.audioCtx || !this.audioCtx.createGain) {
+			return this.audioCtx ? this.audioCtx.destination : null;
+		}
+		if (!this.playbackGain) {
+			this.playbackGain = this.audioCtx.createGain();
+			this.playbackGain.connect(this.audioCtx.destination);
+		}
+		return this.playbackGain;
+	}
+
+	// 三档增益循环：×1 → ×1.8 → ×3 → ×1，同步按钮标签
+	// Cycle gain ×1 -> ×1.8 -> ×3 -> ×1 and update the button label
+	togglePlaybackBoost() {
+		const levels = [1, 1.8, 3];
+		this.playbackBoost = (this.playbackBoost + 1) % 3;
+		this.ensureAudioUnlocked();
+		const gain = this.getPlaybackGain();
+		if (gain && 'gain' in gain) {
+			gain.gain.value = levels[this.playbackBoost];
+		}
+		this.updateBoostButton();
+	}
+
+	updateBoostButton() {
+		const label = $id('voice-boost-label');
+		if (label) {
+			const levels = ['×1', '×1.8', '×3'];
+			label.textContent = levels[this.playbackBoost];
 		}
 	}
 
