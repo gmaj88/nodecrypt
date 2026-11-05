@@ -156,6 +156,89 @@ export async function markDeviceOffline(storage, channelHash, clientId) {
 	}
 }
 
+// 离线厂商通知体：标题/内容 + 点击跳转行为
+// Offline vendor notification: title/body + click behaviour
+// 离线送达必须带 push_channel（厂商通道）：只写 push_message 时消息仅存个推离线库，
+// 要等 APP 打开（CID 上线）才补投 —— 正是"杀进程收不到、打开 APP 才收到"的原因。
+// click_type:'intent' 是厂商离线点击携带 payload 的唯一可靠方式（DCloud 固定格式），
+// S.payload 原样交给 5+ Push 的 payload（这里是房间 hash，零明文）。
+// Offline delivery REQUIRES push_channel: with push_message only, the message sits in
+// Getui's offline store and is redelivered after the app opens - exactly the
+// "not received when killed, arrives on open" symptom. click_type:'intent' (DCloud
+// fixed format) is the only reliable way to carry payload through vendor clicks;
+// S.payload feeds the 5+ Push payload verbatim (the room hash - zero plaintext).
+const NOTIFY_TITLE = 'NodeCrypt';
+const NOTIFY_BODY = '有新消息，点击查看';
+
+// 环境变量 GETUI_ANDROID_PACKAGE 必须与云打包设置的 Android 包名一致（intent 依赖它）
+// Env GETUI_ANDROID_PACKAGE must equal the Android package name set in cloud packaging
+function buildVendorNotification(env, payloadText) {
+	try {
+		const pkg = String(env.GETUI_ANDROID_PACKAGE || '').trim();
+		if (!pkg) {
+			// 未配置包名：退化为打开应用首页（点击后 payload 可能丢失，仅能进 APP）
+			// Package name missing: fall back to launch home (payload may be lost on click)
+			return { click_type: 'startapp', payload: payloadText };
+		}
+		return {
+			click_type: 'intent',
+			intent:
+				`intent://io.dcloud.unipush/?#Intent;scheme=unipush;launchFlags=0x4000000;` +
+				`component=${pkg}/io.dcloud.PandoraEntry;S.UP-OL-SU=true;` +
+				`S.title=${NOTIFY_TITLE};S.content=${NOTIFY_BODY};S.payload=${payloadText};end`
+		};
+	} catch (error) {
+		return { click_type: 'startapp', payload: payloadText };
+	}
+}
+
+// 组装一次 cid 单推的完整请求体（在线个推通道 + 离线厂商通道）
+// Assemble one single-cid push body (online Getui channel + offline vendor channel)
+function buildPushBody(env, channelHash, audienceCid) {
+	const payloadText = channelHash;
+	const vendorNotification = buildVendorNotification(env, payloadText);
+	return {
+		request_id: requestId(),
+		audience: { cid: [audienceCid] },
+		settings: { ttl: 3600000 },
+		push_message: {
+			notification: {
+				title: NOTIFY_TITLE,
+				body: NOTIFY_BODY,
+				click_type: 'startapp',
+				payload: payloadText
+			}
+		},
+		push_channel: {
+			android: {
+				ups: {
+					notification: Object.assign({
+						title: NOTIFY_TITLE,
+						body: NOTIFY_BODY
+					}, vendorNotification),
+					// 华为桌面角标 +1（客户端进房间/回首页时会清零或重算）
+					// Huawei launcher badge +1 (client clears/recomputes it when entering a room / home)
+					options: {
+						HW: {
+							'/message/android/notification/badge/class': 'io.dcloud.PandoraEntry',
+							'/message/android/notification/badge/add_num': 1
+						}
+					}
+				}
+			},
+			ios: {
+				type: 'notify',
+				payload: payloadText,
+				aps: {
+					alert: { title: NOTIFY_TITLE, body: NOTIFY_BODY },
+					'content-available': 0
+				},
+				auto_badge: '+1'
+			}
+		}
+	};
+}
+
 // 推送通知（不 await 结果也安全；由 DO 的 await 链路保证调度）
 // Send push notifications (safe fire-and-forget; scheduled via DO await chain)
 export async function notifyOfflineDevices(env, storage, channelHash) {
@@ -171,10 +254,6 @@ export async function notifyOfflineDevices(env, storage, channelHash) {
 		if (!token) {
 			return;
 		}
-		const payload = JSON.stringify({
-			type: 'nodecrypt-msg',
-			hash: channelHash
-		});
 		for (const cid of tokens) {
 			try {
 				const response = await fetch(`${GETUI_REST_BASE}/${env.GETUI_APP_ID}/push/single/cid`, {
@@ -183,19 +262,7 @@ export async function notifyOfflineDevices(env, storage, channelHash) {
 						'Content-Type': 'application/json',
 						'token': token
 					},
-					body: JSON.stringify({
-						request_id: requestId(),
-						audience: { cid: [cid] },
-						settings: { ttl: 3600000 },
-						push_message: {
-							notification: {
-								title: 'NodeCrypt',
-								body: '有新消息，点击查看',
-								click_type: 'startapp',
-								payload: payload
-							}
-						}
-					}),
+					body: JSON.stringify(buildPushBody(env, channelHash, cid)),
 					signal: AbortSignal.timeout(10000)
 				});
 				const json = await response.json();
@@ -300,25 +367,12 @@ export async function debugPush(env, storage, channelHash) {
 			return result;
 		}
 		result.auth = 'ok';
-		const payload = JSON.stringify({ type: 'nodecrypt-msg', hash: channelHash });
 		for (const cid of offlineTokens) {
 			try {
 				const response = await fetch(`${GETUI_REST_BASE}/${env.GETUI_APP_ID}/push/single/cid`, {
 					method: 'POST',
 					headers: { 'Content-Type': 'application/json', 'token': tokenInfo.token },
-					body: JSON.stringify({
-						request_id: requestId(),
-						audience: { cid: [cid] },
-						settings: { ttl: 3600000 },
-						push_message: {
-							notification: {
-								title: 'NodeCrypt',
-								body: '有新消息，点击查看',
-								click_type: 'startapp',
-								payload: payload
-							}
-						}
-					}),
+					body: JSON.stringify(buildPushBody(env, channelHash, cid)),
 					signal: AbortSignal.timeout(10000)
 				});
 				let json = null;
