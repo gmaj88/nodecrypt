@@ -5,6 +5,7 @@ import {
 	on,
 	createElement
 } from './util.dom.js';
+import { t } from './util.i18n.js';
 
 // Process and compress image file
 // 处理并压缩图片文件
@@ -47,13 +48,8 @@ export async function processImage(file, callback) {
 }
 
 // Translate message key
-// 翻译消息 key
-function t(key) {
-	const messages = {
-		tooLarge: 'Image is too large (over 8MB)', // 图片过大（超过8MB）
-	};
-	return messages[key] || key
-}
+// 翻译消息 key（使用全局 i18n：image.too_large 已入 en/zh 词典）
+// Image-too-large alert via global i18n dictionary
 
 // Create image preview element for input
 // 为输入框创建图片预览元素
@@ -126,7 +122,7 @@ export function setupImagePaste(inputSelector) {
 				if (!file) continue;
 
 				if (file.size > 8 * 1024 * 1024) {
-					alert(t('tooLarge'));
+				alert(t('image.too_large'));
 					continue;
 				}
 
@@ -192,7 +188,7 @@ export function setupImageSend({
 			// Check file size
 			// 检查文件大小
 			if (file.size > 5 * 1024 * 1024) {
-				alert(t('tooLarge'));
+						alert(t('image.too_large'));
 				return
 			}
 			
@@ -218,7 +214,7 @@ export function setupImageSend({
 					// Check file size
 					// 检查文件大小
 					if (file.size > 5 * 1024 * 1024) {
-						alert(t('tooLarge'));
+				alert(t('image.too_large'));
 						continue
 					}
 					

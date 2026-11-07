@@ -26,6 +26,9 @@ export class VoiceChat {
 		this.timerInterval = null;
 		this.pendingCandidates = new Map();
 		this.activeCallers = new Set();
+		// 一对一通话目标成员；null = 群呼模式（全房间 mesh）
+		// One-on-one call target; null = group call (whole-room mesh)
+		this.directPeerId = null;
 		this.audioCtx = null;
 		// WebAudio 兜底路由：WebView 中 <audio> 播放可能被自动播放策略拦截，
 		// 远端流经 WebAudio 输出可绕开该限制（走媒体音量流）
@@ -118,6 +121,12 @@ export class VoiceChat {
 	sendVoiceSignaling(type, data) {
 		const chat = this.getCurrentRoomChat();
 		if (!chat) return;
+		// 一对一模式：信令只发给通话目标，其他成员收不到密文也不参与
+		// Direct mode: signaling goes only to the call target
+		if (this.directPeerId) {
+			this.sendVoiceSignalingTo(this.directPeerId, type, data);
+			return;
+		}
 		const peers = this.getPeersWithSharedKey();
 		for (const { peerId } of peers) {
 			this.sendVoiceSignalingTo(peerId, type, data);
@@ -144,8 +153,12 @@ export class VoiceChat {
 		}
 	}
 
-	async startCall() {
+	async startCall(targetPeerId = null) {
 		if (this.isInCall) return;
+
+		// 群呼前清空一对一状态
+		// Reset direct-call state before a group call
+		this.directPeerId = null;
 
 		if (!VoiceChat.isSupported()) {
 			addSystemMsg(t('voice.not_supported', 'Voice chat is not supported in this browser'));
@@ -164,6 +177,17 @@ export class VoiceChat {
 		if (peers.length === 0) {
 			addSystemMsg(t('voice.no_peers', 'No other members to call'));
 			return;
+		}
+
+		// 一对一模式：校验目标在线（有 shared 密钥）才继续
+		// Direct mode: validate the target still has a shared key
+		if (targetPeerId) {
+			const target = peers.find(p => p.peerId === targetPeerId);
+			if (!target) {
+				addSystemMsg(t('voice.no_peers', 'No other members to call'));
+				return;
+			}
+			this.directPeerId = targetPeerId;
 		}
 
 		// 不再依赖 enumerateDevices 预检（WebView 授权状态变化时会漏报 audioinput，
@@ -200,11 +224,24 @@ export class VoiceChat {
 
 		const rd = roomsData[activeRoomIndex];
 		const userName = rd ? rd.myUserName : '';
-		addSystemMsg(t('voice.user_joined', '{name} joined voice chat').replace('{name}', userName));
+		if (this.directPeerId) {
+			// 一对一：提示正在邀请目标成员
+			// Direct mode: announce the invite to the target
+			const targetName = rd && rd.userMap && rd.userMap[this.directPeerId]
+				? (rd.userMap[this.directPeerId].userName || this.directPeerId)
+				: this.directPeerId;
+			addSystemMsg(t('voice.direct_starting', '{name} joined voice chat').replace('{name}', targetName));
+		} else {
+			addSystemMsg(t('voice.user_joined', '{name} joined voice chat').replace('{name}', userName));
+		}
 
 		this.sendVoiceSignaling('voice-active', {});
 
-		if (this.activeCallers.size === 0) {
+		if (this.directPeerId) {
+			// 一对一：只对目标成员发起 offer（对方未入会，会经 direct offer 自动接听）
+			// Direct: offer only the target peer (callee auto-accepts via direct offer)
+			await this.createOfferForPeer(this.directPeerId, true);
+		} else if (this.activeCallers.size === 0) {
 			for (const { peerId } of peers) {
 				await this.createOfferForPeer(peerId);
 			}
@@ -215,13 +252,58 @@ export class VoiceChat {
 		this.updateCallIndicator();
 	}
 
-	async createOfferForPeer(peerId) {
+	// 一对一来电自动接听：对方未入会即收到 direct offer 时调用
+	// Auto-accept an incoming one-on-one call (direct offer received while not in call)
+	async acceptDirectCall(peerId) {
+		this.ensureAudioUnlocked();
+
+		// 与群呼一致：先拉 TURN（蜂窝 NAT 兜底），失败不阻塞
+		// Same as group calls: try TURN first, never blocks
+		await this.loadIceServers();
+
+		try {
+			this.localStream = await navigator.mediaDevices.getUserMedia({
+				audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
+				video: false
+			});
+			this.listenOnly = false;
+		} catch (e) {
+			console.error('[VoiceChat] accept mic failed:', e && e.name, e);
+			addSystemMsg(this.describeMicError(e));
+			addSystemMsg(t('voice.listen_only', 'No microphone — joining in listen-only mode, you can still hear others'));
+			this.listenOnly = true;
+		}
+
+		try {
+			if (this.audioCtx && this.audioCtx.state === 'suspended') {
+				await this.audioCtx.resume();
+			}
+		} catch (e) { /* ignore */ }
+
+		this.isInCall = true;
+		this.callStartTime = Date.now();
+		this.directPeerId = peerId;
+		this.updateVoiceUI(true);
+		this.startTimer();
+
+		const rd = roomsData[activeRoomIndex];
+		const callerName = rd && rd.userMap && rd.userMap[peerId]
+			? (rd.userMap[peerId].userName || peerId)
+			: peerId;
+		addSystemMsg(t('voice.direct_incoming', '{name} invited you to a one-on-one call — connecting automatically').replace('{name}', callerName));
+
+		this.sendVoiceSignaling('voice-active', {});
+		this.updateCallIndicator();
+	}
+
+	async createOfferForPeer(peerId, direct = false) {
 		const pc = this.createPeerConnection(peerId);
 		try {
 			const offer = await pc.createOffer();
 			await pc.setLocalDescription(offer);
 			this.sendVoiceSignalingTo(peerId, 'voice-offer', {
-				sdp: pc.localDescription.toJSON()
+				sdp: pc.localDescription.toJSON(),
+				direct: direct
 			});
 		} catch (e) {
 			console.error('[VoiceChat] create offer error:', e);
@@ -425,6 +507,11 @@ export class VoiceChat {
 	handlePeerDisconnected(peerId) {
 		this.closePeerConnection(peerId);
 		if (this.isInCall) this.updateVoiceUI(true);
+		// 一对一：连接最终失败（ICE 重启也救不回）→ 自动挂断并退出通话
+		// Direct call: final connection failure (ICE restart didn't help) → auto hang-up
+		if (this.directPeerId && peerId === this.directPeerId) {
+			this.leaveCall();
+		}
 	}
 
 	async restartIceForPeer(peerId) {
@@ -447,7 +534,11 @@ export class VoiceChat {
 			this.handleActiveStatus(msg);
 			return;
 		}
-		if (!this.isInCall && type !== 'voice-join') return;
+		// voice-offer 必须放行到 handleOffer：未入会时收到 direct offer 要自动接听，
+		// 非 direct 的群呼 offer 仍将在 handleOffer 内被忽略
+		// voice-offer must reach handleOffer: a direct offer while not in call is auto-accepted;
+		// non-direct (group) offers stay ignored there
+		if (!this.isInCall && type !== 'voice-join' && type !== 'voice-offer') return;
 
 		const senderId = msg.clientId;
 		const data = msg.data || {};
@@ -486,12 +577,24 @@ export class VoiceChat {
 	}
 
 	async handleVoiceJoin(peerId) {
-		if (!this.isInCall) return;
+		if (!this.isInCall || this.directPeerId) return;
 		await this.createOfferForPeer(peerId);
 	}
 
 	async handleOffer(peerId, data) {
-		if (!data.sdp) return;
+		if (!data || !data.sdp) return;
+		const isDirectInvite = data.direct === true;
+		if (this.isInCall) {
+			// 群呼中不接受一对一邀请；一对一通话中只处理通话目标本身的信令（含 ICE 重启）
+			// Ignore 1:1 invites while in a group call; in a direct call only process the target's signaling
+			if (isDirectInvite) return;
+			if (this.directPeerId && peerId !== this.directPeerId) return;
+		} else {
+			// 未入会：只有标记 direct 的 offer 视为一对一来电并自动接听
+			// Not in call: only direct-flagged offers are 1:1 invites and get auto-accepted
+			if (!isDirectInvite) return;
+			await this.acceptDirectCall(peerId);
+		}
 		const pc = this.createPeerConnection(peerId);
 		try {
 			await pc.setRemoteDescription(new RTCSessionDescription(data.sdp));
@@ -551,6 +654,22 @@ export class VoiceChat {
 	}
 
 	handleVoiceLeave(peerId) {
+		if (this.directPeerId) {
+			// 一对一通话中：只关心对方；对方离开/下线 → 自动挂断
+			// In a direct call: only the target matters; if they leave, hang up automatically
+			if (peerId !== this.directPeerId) return;
+			this.closePeerConnection(peerId);
+			this.activeCallers.delete(peerId);
+			const rd = roomsData[activeRoomIndex];
+			const name = rd && rd.userMap && rd.userMap[peerId]
+				? (rd.userMap[peerId].userName || peerId)
+				: peerId;
+			if (this.isInCall) {
+				addSystemMsg(t('voice.user_left', '{name} left voice chat').replace('{name}', name));
+			}
+			this.leaveCall();
+			return;
+		}
 		this.closePeerConnection(peerId);
 		this.activeCallers.delete(peerId);
 		if (this.isInCall) {
@@ -595,6 +714,9 @@ export class VoiceChat {
 			this.closePeerConnection(peerId);
 		}
 		this.peerConnections.clear();
+		// 通话结束后恢复群呼模式（voice-leave 消息是点对点的，不受影响）
+		// Restore group-call mode after the call ends
+		this.directPeerId = null;
 		if (this.localStream) {
 			this.localStream.getTracks().forEach(track => track.stop());
 			this.localStream = null;
@@ -630,7 +752,9 @@ export class VoiceChat {
 	onNewPeerJoined(peerId) {
 		// 仅听模式也需为新成员建立连接（recvonly offer），继续接收其音频
 		// Listen-only peers also connect to new members (recvonly offer) to keep receiving audio
-		if (!this.isInCall) return;
+		// 一对一通话中不自动连接新成员（避免第三方混入）
+		// Skip new members while in a direct call
+		if (!this.isInCall || this.directPeerId) return;
 		const peers = this.getPeersWithSharedKey();
 		if (!peers.some(p => p.peerId === peerId)) return;
 		this.sendVoiceSignalingTo(peerId, 'voice-active', {});
@@ -689,7 +813,7 @@ export class VoiceChat {
 			} else if (this.activeCallers.size > 0) {
 				voiceBtn.title = t('voice.join_call', 'Join voice call');
 			} else {
-				voiceBtn.title = '';
+				voiceBtn.title = t('voice.call_direct_hint', 'Tap to start a group call, long-press for a one-on-one call');
 			}
 		}
 	}

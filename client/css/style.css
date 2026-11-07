@@ -2026,3 +2026,42 @@ flex-direction: column;
 h2{
 	margin: 0%;
 }
+/* ===== 一对一通话选人面板 / One-on-one call picker ===== */
+.voice-direct-modal {
+	position: fixed;
+	inset: 0;
+	z-index: 3000;
+	background: rgba(0, 0, 0, 0.45);
+	display: flex;
+	align-items: center;
+	justify-content: center;
+}
+.voice-direct-card {
+	background: var(--bg-panel, #fff);
+	border-radius: 14px;
+	min-width: 220px;
+	max-width: 320px;
+	max-height: 60vh;
+	overflow-y: auto;
+	box-shadow: 0 8px 30px rgba(0, 0, 0, 0.25);
+	padding: 14px 12px;
+}
+.voice-direct-title {
+	font-size: 14px;
+	font-weight: 600;
+	text-align: center;
+	margin-bottom: 10px;
+	opacity: 0.85;
+}
+.voice-direct-item {
+	padding: 10px 14px;
+	border-radius: 8px;
+	cursor: pointer;
+	font-size: 14px;
+}
+.voice-direct-item:hover {
+	background: rgba(0, 120, 255, 0.1);
+}
+.voice-direct-item:active {
+	background: rgba(0, 120, 255, 0.2);
+}

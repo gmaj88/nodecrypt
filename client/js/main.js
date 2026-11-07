@@ -302,9 +302,70 @@ window.addEventListener('DOMContentLoaded', () => {
 	const voiceChat = initVoiceChat();
 	window.voiceChat = voiceChat;
 
+	// 一对一通话选人面板：长按语音按钮弹出，列出除自己以外的在房成员
+	// One-on-one call picker: long-press the voice button to pick a member
+	function showDirectCallPicker() {
+		const rd = roomsData[activeRoomIndex];
+		if (!rd || !rd.chat) return;
+		const members = [];
+		for (const peerId in rd.userMap) {
+			if (rd.myId && peerId === rd.myId) continue;
+			const u = rd.userMap[peerId];
+			const name = u.userName || u.username || u.name || '';
+			if (name) members.push({ peerId, name });
+		}
+		if (members.length === 0) {
+			addSystemMsg(t('voice.no_peers', 'No other members to call'));
+			return;
+		}
+		const overlay = document.createElement('div');
+		overlay.className = 'voice-direct-modal';
+		const items = members.map(m =>
+			`<div class="voice-direct-item" data-peer="${m.peerId}"><span class="member-name">${m.name}</span></div>`
+		).join('');
+		overlay.innerHTML = `<div class="voice-direct-card"><div class="voice-direct-title">${t('voice.direct_pick_title', 'One-on-one call · pick a member')}</div><div class="voice-direct-list">${items}</div></div>`;
+		document.body.appendChild(overlay);
+		const close = () => { if (overlay.parentNode) overlay.parentNode.removeChild(overlay); };
+		overlay.addEventListener('click', (e) => {
+			if (e.target === overlay) { close(); return; }
+			const itemEl = e.target.closest('.voice-direct-item');
+			if (itemEl) {
+				close();
+				const peerId = itemEl.getAttribute('data-peer');
+				voiceChat.startCall(peerId);
+			}
+		});
+	}
+
 	const voiceBtn = $id('chat-voice-btn');
 	if (voiceBtn) {
+		let pressTimer = null;
+		let longPressed = false;
+		// 长按 500ms 弹出一对一选人面板；单击仍为群呼
+		// Long-press (500ms) opens the picker; a simple tap stays a group call
+		voiceBtn.addEventListener('pointerdown', () => {
+			if (voiceChat.isInCall) return;
+			longPressed = false;
+			pressTimer = setTimeout(() => {
+				pressTimer = null;
+				longPressed = true;
+				showDirectCallPicker();
+			}, 500);
+		});
+		const clearPress = () => {
+			if (pressTimer) {
+				clearTimeout(pressTimer);
+				pressTimer = null;
+			}
+		};
+		voiceBtn.addEventListener('pointerup', clearPress);
+		voiceBtn.addEventListener('pointerleave', clearPress);
+		voiceBtn.addEventListener('pointercancel', clearPress);
 		voiceBtn.addEventListener('click', async () => {
+			if (longPressed) {
+				longPressed = false;
+				return;
+			}
 			if (voiceChat.isInCall) {
 				voiceChat.leaveCall();
 			} else {

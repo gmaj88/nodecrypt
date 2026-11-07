@@ -60,3 +60,26 @@
 ## 8. 语音
 - WebRTC mesh；播放经 WebAudio 增益（×1/×1.8/×3）；×3 会提示"外放过大易啸叫，建议耳机"。
 - 远端音频无声历史根因：WebView 自动播放限制 + 通话音量通道音量小；反射解锁 + 增益解决。
+
+### 8.1 一对一通话（2026-11-07 新增）
+- 入口：语音按钮**单击=群呼**（不变），**长按 500ms=弹选人面板**（列出房内除自己以外的成员）。
+- 发起方：`startCall(peerId)` 设 `directPeerId`，信令只发给该成员（voice-active/offer 带 `direct:true`）。
+- 接听方：**自动接听**——未入会时收到 `direct:true` 的 offer 即加入（getUserMedia 首次会弹麦克风授权，等同确认）；群呼 offer 在未入会时仍被忽略，群呼中收到的 1:1 邀请也忽略。
+- 通话中：所有信令（mute/inactive）只发给对端；新成员加入不自动建连；对方 语音挂断/离开房间/连接失败（ICE 重启无效）→ 本端自动退出通话并恢复群呼模式。
+- 媒体：WebRTC DTLS-SRTP 点对点，两人可解；信令密文也只有目标成员收到。服务器零改动。
+- 相关 i18n 键：`voice.call_direct_hint / direct_pick_title / direct_starting / direct_incoming`。
+
+## 9. 输入限制（web 与 APP 已统一，2026-11-07）
+统一规则：**用户名 / 房间名 / 频道密码**三者一致——
+- **长度上限 15 字符**（web: input `maxlength=15`；APP: `slice(0,15)`）。
+- **禁止空白符**（空格/Tab/全角空格等 `\s`）：
+  - web：`ui.js preventSpaceInput`（keydown 拦截 + input 剥离）；
+  - APP：`uniapp/pages/index/index.vue` 各输入点 `replace(/\s+/g,'')`；APP 添加频道的"房间名[空格]密码"写法中，空格仅作分隔符，房间名/密码内部不得含空白符。
+- **特殊字符（ASCII 标点/符号）已放开**：`!@#$%^&*()-_+=[]{}<>.,;:|\/?` 等均可输入（旧版 web 曾禁 `preventSpaceInput` 内的 ASCII 标点，2026-11-07 放开）。
+- 撇号 `'`、中文、emoji、**全角标点（（）！等）**均合法。
+- 服务端零校验（盲中继，房间名仅参与 sha256 派生；消息内容另有 DOMPurify 防注入：`util.string.js` 只放行 `<br>`）。
+- 消息正文（聊天输入框）无上述限制，任意字符均可。
+
+## 10. i18n 约定（避免"新增文案变英文"的坑）
+- 所有面向用户的文案必须走 `client/js/util.i18n.js` 的 `t(key, fallback)`，**en 与 zh 两本词典都要补键**（历史上两本常只补一边 → fallback 英文直出）。
+- 禁止模块内自造本地 `t()`（曾致图片过大弹窗英文，已改为全局 i18n `image.too_large`）。

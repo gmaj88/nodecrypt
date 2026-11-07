@@ -116,7 +116,7 @@ export function joinRoom(userName, roomName, password, modal = null, onResult) {
 	let chatInst = null;
 	const callbacks = {
 		onServerClosed: () => {
-			setStatus('Node connection closed');
+			setStatus(t('status.disconnected', 'Node connection closed'));
 			// Leave voice call on disconnect
 			if (window.voiceChat && window.voiceChat.isInCall) {
 				window.voiceChat.leaveCall();

@@ -387,19 +387,18 @@ export function setupMoreBtnMenu() {
 	});
 }
 
-// Prevent space and special character input
-// 禁止输入空格和特殊字符
+// Prevent whitespace input only (punctuation is allowed now; same rule as the APP side,
+// 15-char cap is enforced by maxlength)
+// 仅禁止空白符输入（特殊符号已放开，与 APP 端规则一致，15 字上限交给 maxlength）
 export function preventSpaceInput(input) {
 	if (!input) return;
 	input.addEventListener('keydown', function(e) {
-		if (e.key === ' ' || (/[\u0000-\u007f]/.test(e.key) && /[\p{P}\p{S}]/u.test(e.key) && e.key !== "'")) {
+		if (/\s/u.test(e.key)) {
 			e.preventDefault()
 		}
 	});
-	input.addEventListener('input', function(e) {
-		input.value = input.value.replace(/[\s\p{P}\p{S}]/gu, function(match) {
-			return match === "'" ? "'" : ''
-		})
+	input.addEventListener('input', function() {
+		input.value = input.value.replace(/\s/g, '')
 	})
 }
 

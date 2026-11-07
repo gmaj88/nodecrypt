@@ -169,7 +169,7 @@ function setupSettingsPanel() {
 		const checked = e.target.checked;
 		if (checked) {
 			if (!('Notification' in window)) {
-				alert('Notifications are not supported by your browser.');
+				alert(t('notification.not_supported', 'Notifications are not supported by your browser.'));
 				e.target.checked = false;
 				return
 			}
@@ -181,9 +181,9 @@ function setupSettingsPanel() {
 					saveSettings(settings);
 					applySettings(settings);					// 防止重复通知，添加一个标志位
 					if (!settingsSidebar._notificationShown) {
-						new Notification('Notifications enabled', {
-							body: 'You will receive alerts here.'
-						});
+					new Notification(t('notification.enabled', 'Notifications enabled'), {
+						body: t('notification.alert_here', 'You will receive alerts here.')
+					});
 						settingsSidebar._notificationShown = true; // 设置标志位
 					}
 				} else {
@@ -191,7 +191,7 @@ function setupSettingsPanel() {
 					e.target.checked = false;
 					saveSettings(settings);
 					applySettings(settings);
-					alert('Please allow notifications in your browser settings.')
+					alert(t('notification.allow_browser', 'Please allow notifications in your browser settings.'))
 				}
 			})
 		} else {

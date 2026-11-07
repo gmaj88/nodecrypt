@@ -112,6 +112,13 @@ const LANGUAGES = {
 			'voice.no_peers': 'No other members to call',
 			'voice.open_audio': 'Open audio',
 			'voice.close_audio': 'Close audio',
+			'voice.boost_echo_hint': 'Speaker boost is at max — far-field speaker use may cause echo/howling; use headphones or lower the boost',
+			'voice.call_direct_hint': 'Tap to start a group call, long-press for a one-on-one call',
+			'voice.direct_pick_title': 'One-on-one call · pick a member',
+			'voice.direct_starting': 'Inviting {name} to a one-on-one call…',
+			'voice.direct_incoming': '{name} invited you to a one-on-one call — connecting automatically',
+			'image.too_large': 'Image is too large (over 8MB)',
+			'status.disconnected': 'Node connection closed',
 					// Help page
 			'help.title': 'User Guide',
 			'help.back_to_login': 'Back to Login',
@@ -261,6 +268,13 @@ const LANGUAGES = {
 			'voice.no_peers': '没有可呼叫的成员',
 			'voice.open_audio': '打开音频',
 			'voice.close_audio': '关闭音频',
+			'voice.boost_echo_hint': '外放增益已开到最大，外放容易产生回声/啸叫，建议佩戴耳机或适当降低增益',
+			'voice.call_direct_hint': '单击发起群聊语音，长按选择成员一对一通话',
+			'voice.direct_pick_title': '一对一通话 · 选择成员',
+			'voice.direct_starting': '正在邀请 {name} 一对一通话…',
+			'voice.direct_incoming': '{name} 邀请你进行一对一通话，已自动接入',
+			'image.too_large': '图片过大（超过 8MB）',
+			'status.disconnected': '节点连接已断开',
 			
 			// Help page
 			'help.title': '使用说明',
