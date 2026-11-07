@@ -1,0 +1,10 @@
+# 静态资源缓存策略（Workers Static Assets 支持 _headers 文件）
+# Static asset cache policy (Workers Static Assets reads _headers)
+# 带 hash 版本号的 assets 可永久缓存，解决 APP 内嵌页面重复打开时重新下载的问题
+# Hashed assets are immutable; speeds up reopening the page inside the APP shell
+
+/assets/*
+  Cache-Control: public, max-age=31536000, immutable
+
+/index.html
+  Cache-Control: no-cache

@@ -1,5 +1,5 @@
 import { generateClientId, encryptMessage, decryptMessage, logEvent, isString, isObject, getTime } from './utils.js';
-import { upsertDevice, markDeviceOffline, notifyOfflineDevices, listAllDevices, purgeDevices, debugPush } from './push.js';
+import { upsertDevice, markDeviceOffline, notifyOfflineDevices, listAllDevices, purgeDevices, debugPush, debugTaskDetail } from './push.js';
 import { getVoiceTurnIceServers } from './voiceTurn.js';
 
 export default {
@@ -140,6 +140,15 @@ export class ChatRoom {  constructor(state, env) {
           // Test aid: wipe device registrations for a hash (or all) to clear stale reinstall cids
           const deleted = await purgeDevices(this.state.storage, hash);
           return new Response(JSON.stringify({ purged: true, hash: hash || 'all', removed: deleted }), { headers: { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' } });
+        }
+        if (params.get('report') === '1') {
+          const taskid = params.get('taskid') || '';
+          const cid = params.get('cid') || '';
+          if (!taskid || !cid) {
+            return new Response(JSON.stringify({ error: 'taskid & cid required' }), { status: 400, headers: { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' } });
+          }
+          const data = await debugTaskDetail(this.env, this.state.storage, cid, taskid);
+          return new Response(JSON.stringify(data), { headers: { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' } });
         }
         if (hash) {
           const data = params.get('push') === '1'

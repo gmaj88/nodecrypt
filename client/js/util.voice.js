@@ -378,6 +378,12 @@ export class VoiceChat {
 			gain.gain.value = levels[this.playbackBoost];
 		}
 		this.updateBoostButton();
+		// 最高档外放显著增强麦克风拾音回路，双端外放距离远时易啸叫，主动提示
+		// Highest boost amplifies the mic pickup loop; warn before the user
+		// experiences speaker feedback during far-field calls
+		if (levels[this.playbackBoost] === 3) {
+			addSystemMsg(t('voice.boost_echo_hint', 'Max speaker volume — use headphones or lower the boost to avoid echo/howling'));
+		}
 	}
 
 	updateBoostButton() {

@@ -169,10 +169,23 @@ export async function markDeviceOffline(storage, channelHash, clientId) {
 // S.payload feeds the 5+ Push payload verbatim (the room hash - zero plaintext).
 const NOTIFY_TITLE = 'NodeCrypt';
 const NOTIFY_BODY = '有新消息，点击查看';
+// 点击进房兜底标记：非华为（个推离线库补投）路径的 click payload 会被个推/DCloud
+// 重组成 title/content 而丢失自定义 payload（实测），所以把房间 hash 的前 8 位放进
+// 正文 [xxxxxxxx] —— 客户端从 content 提取做前缀匹配即可进房。服务器仍不知房间名
+// （截断 hash 无明文，碰撞概率对个位数频道可忽略），保持盲中继设计。
+// Routing fallback tag: the Getui-store redelivery path rebuilds the click payload
+// as title/content and drops our custom payload (observed on-device), so embed the
+// first 8 hex chars of the room hash into the body as [xxxxxxxx]; the client
+// prefix-matches it against registered channels. The server still never learns the
+// room name (truncated hash, collision negligible for single-digit channel counts),
+// preserving the blind-relay design.
+function notifyBody(channelHash) {
+	return `${NOTIFY_BODY} [${String(channelHash || '').slice(0, 8)}]`;
+}
 
 // 环境变量 GETUI_ANDROID_PACKAGE 必须与云打包设置的 Android 包名一致（intent 依赖它）
 // Env GETUI_ANDROID_PACKAGE must equal the Android package name set in cloud packaging
-function buildVendorNotification(env, payloadText) {
+function buildVendorNotification(env, payloadText, bodyText) {
 	try {
 		const pkg = String(env.GETUI_ANDROID_PACKAGE || '').trim();
 		if (!pkg) {
@@ -185,7 +198,7 @@ function buildVendorNotification(env, payloadText) {
 			intent:
 				`intent://io.dcloud.unipush/?#Intent;scheme=unipush;launchFlags=0x4000000;` +
 				`component=${pkg}/io.dcloud.PandoraEntry;S.UP-OL-SU=true;` +
-				`S.title=${NOTIFY_TITLE};S.content=${NOTIFY_BODY};S.payload=${payloadText};end`
+				`S.title=${NOTIFY_TITLE};S.content=${bodyText};S.payload=${payloadText};end`
 		};
 	} catch (error) {
 		return { click_type: 'startapp' };
@@ -201,7 +214,8 @@ function buildVendorNotification(env, payloadText) {
 // fallback happens atomically inside Getui, one message is never double-sent.
 function buildPushBody(env, channelHash, audienceCid, testMessage) {
 	const payloadText = channelHash;
-	const vendorNotification = buildVendorNotification(env, payloadText);
+	const bodyText = notifyBody(channelHash);
+	const vendorNotification = buildVendorNotification(env, payloadText, bodyText);
 	const body = {
 		request_id: requestId(),
 		audience: { cid: [audienceCid] },
@@ -209,7 +223,7 @@ function buildPushBody(env, channelHash, audienceCid, testMessage) {
 		push_message: {
 			notification: {
 				title: NOTIFY_TITLE,
-				body: NOTIFY_BODY,
+				body: bodyText,
 				click_type: 'startapp',
 				payload: payloadText
 			}
@@ -219,7 +233,7 @@ function buildPushBody(env, channelHash, audienceCid, testMessage) {
 				ups: {
 					notification: Object.assign({
 						title: NOTIFY_TITLE,
-						body: NOTIFY_BODY
+						body: bodyText
 					}, vendorNotification),
 					// 华为通知自分类权益：服务端必须携带 category（"即时聊天"=IM）才会按
 					// 服务与通讯类计（推送数量不受 2 条/日/设备 的资讯营销类频控）；
@@ -240,19 +254,21 @@ function buildPushBody(env, channelHash, audienceCid, testMessage) {
 				type: 'notify',
 				payload: payloadText,
 				aps: {
-					alert: { title: NOTIFY_TITLE, body: NOTIFY_BODY },
+					alert: { title: NOTIFY_TITLE, body: bodyText },
 					'content-available': 0
 				},
 				auto_badge: '+1'
 			}
 		}
 	};
-	if (testMessage) {
-		// 厂商测试通道标记：华为调测阶段每应用每日 1000 条测试消息，不占 2 条/日 额度；
-		// 仅用于诊断端点（?push=1&test=1），正式推送绝不携带此标记。
-		// Vendor test-message flag: Huawei allows 1000/day app-wide test messages in the
-		// debug phase (does not consume the 2/day quota). Only used by the diagnostic
-		// endpoint (?push=1&test=1); production pushes must never carry this.
+	// 测试通道标记：华为调测阶段每应用每日 1000 条测试消息，不占"营销类 2 条/日/设备"额度。
+	// 触发来源：诊断端点（?push=1&test=1）或环境变量 GETUI_TEST_MODE=1（用户级开关，
+	// 让正式推送整体走测试通道绕过 2 条额度的临时方案 —— 代价是走华为测试通道的特殊路径，稳定后建议关闭）。
+	// Vendor test-message flag: Huawei allows 1000/day test messages in the debug phase,
+	// bypassing the 2/day marketing quota. Driven by the diagnostic endpoint (?push=1&test=1)
+	// or the env switch GETUI_TEST_MODE=1 (lets production pushes use the test channel
+	// temporarily; turn it off once stable, since it rides Huawei's special test path).
+	if (testMessage || String(env.GETUI_TEST_MODE || '').trim() === '1') {
 		body.pushOptions = { testMessage: true };
 	}
 	return body;
@@ -442,8 +458,10 @@ export async function debugPush(env, storage, channelHash, testMessage) {
 		};
 		result.androidPackage = String(env.GETUI_ANDROID_PACKAGE || '').trim() || '(unset)';
 		result.hwCategory = hwCategory(env);
-		result.testMessage = testMessage ? true : false;
-		result.vendorBody = buildVendorNotification(env, channelHash);
+		// testMessage 与 GETUI_TEST_MODE=1 任一命中都会走测试通道，这里展示实际生效值
+		// Effective test-channel flag (explicit ?test=1 or GETUI_TEST_MODE=1)
+		result.testMessage = testMessage ? true : String(env.GETUI_TEST_MODE || '').trim() === '1';
+		result.vendorBody = buildVendorNotification(env, channelHash, notifyBody(channelHash));
 		if (!tokenInfo.token) {
 			result.auth = 'failed';
 			result.authCode = tokenInfo.code;
@@ -470,6 +488,34 @@ export async function debugPush(env, storage, channelHash, testMessage) {
 			}
 		}
 		return result;
+	} catch (error) {
+		return { error: String(error && error.message || error) };
+	}
+}
+
+// 查询个推任务级厂商通道真实回执：?report=1&taskid=<id>&cid=<cid>
+export async function debugTaskDetail(env, storage, cid, taskid) {
+	try {
+		if (!isConfigured(env)) return { error: 'GETUI secrets not configured' };
+		const tokenInfo = await requestGetuiToken(env, storage);
+		if (!tokenInfo.token) return { error: 'auth failed', code: tokenInfo.code, msg: tokenInfo.msg };
+		const token = tokenInfo.token;
+		const base = `${GETUI_REST_BASE}/${env.GETUI_APP_ID}`;
+		const headers = { token };
+		const results = { cid, taskid };
+		try {
+			const response = await fetch(`${base}/task/detail/${cid}/${taskid}`, { headers, signal: AbortSignal.timeout(10000) });
+			results.detail = await response.json();
+		} catch (error) {
+			results.detailError = String(error && error.message || error);
+		}
+		try {
+			const response = await fetch(`${base}/report/push/task/${taskid}`, { headers, signal: AbortSignal.timeout(10000) });
+			results.report = await response.json();
+		} catch (error) {
+			results.reportError = String(error && error.message || error);
+		}
+		return results;
 	} catch (error) {
 		return { error: String(error && error.message || error) };
 	}
