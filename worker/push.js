@@ -6,6 +6,11 @@
 
 const GETUI_REST_BASE = 'https://restapi.getui.com/v2';
 const deviceRecordTtl = 30 * 24 * 60 * 60 * 1000;   // 设备注册记录 30 天有效 / device registration TTL
+// 每个频道的离线推送设备注册上限（可用 env GETUI_MAX_CIDS_PER_CHANNEL 覆盖）
+// 防重装重复通知靠 deviceRecordTtl（30 天）兜底；上限只是保险丝，不宜卡死，默认放宽到 32 人内房间无缺口
+// Max registered push devices per channel (overridable via env GETUI_MAX_CIDS_PER_CHANNEL).
+// Reinstall duplicate pushes are bounded by deviceRecordTtl (30 days); the cap is only a fuse.
+const DEFAULT_MAX_CIDS_PER_CHANNEL = 32;
 const tokenCacheKey = (appId) => `getui-token:${appId}`;
 
 function sha256Hex(text) {
@@ -90,9 +95,9 @@ export async function listOfflineDevices(storage, channelHash) {
 	}
 }
 
-// 注册/更新设备（由加密通道内的 a:'dr' 动作触发）
-// Register or update a device row (triggered by encrypted a:'dr' action)
-export async function upsertDevice(storage, channelHash, pushToken, clientId) {
+// 注册/更新设备（由加密通道内的 a:'dr' 动作触发；env 用于读取 CID 上限覆盖）
+// Register or update a device row (triggered by encrypted a:'dr' action; env for cap override)
+export async function upsertDevice(storage, channelHash, pushToken, clientId, env) {
 	try {
 		const key = `devices:${channelHash}`;
 		const devices = (await storage.get(key)) || {};
@@ -113,14 +118,17 @@ export async function upsertDevice(storage, channelHash, pushToken, clientId) {
 			link: clientId,
 			seen: now
 		};
-		// 同一频道最多保留最近 2 个 cid：重装 APP 会产生新 cid，旧的仍有效会堆积，
-		// 导致一条消息推多次（老设备补投）。按 seen 淘汰最旧的。
-		// Keep at most the 2 newest cids per channel: reinstalls mint new cids while old
-		// ones stay valid, causing duplicate pushes. Evict the oldest by seen.
+		// 同一频道最多保留最近 N 个 cid（env GETUI_MAX_CIDS_PER_CHANNEL 可覆盖，默认 32）：
+		// 重装 APP 会产生新 cid，旧的在 TTL 内仍可能有效 → 一条消息推多次（老设备补投），
+		// 按 seen 淘汰最旧的，防重装污染与恶意/异常海量注册。
+		// Keep at most the newest N cids per channel (default 32, env-overridable):
+		// reinstalls mint new cids while old ones may stay valid within TTL, causing
+		// duplicate pushes; evict the oldest by seen (also guards against abuse).
+		const maxCids = Number(env && env.GETUI_MAX_CIDS_PER_CHANNEL) || DEFAULT_MAX_CIDS_PER_CHANNEL;
 		const cidKeys = Object.keys(cleaned);
-		if (cidKeys.length > 2) {
+		if (cidKeys.length > maxCids) {
 			cidKeys.sort((a, b) => (cleaned[b].seen || 0) - (cleaned[a].seen || 0));
-			for (const stale of cidKeys.slice(2)) {
+			for (const stale of cidKeys.slice(maxCids)) {
 				delete cleaned[stale];
 			}
 		}

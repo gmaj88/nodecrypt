@@ -411,7 +411,7 @@ export class ChatRoom {  constructor(state, env) {
       return;
     }
     try {
-      await upsertDevice(this.state.storage, this.clients[clientId].channel, pushToken, clientId);
+      await upsertDevice(this.state.storage, this.clients[clientId].channel, pushToken, clientId, this.env);
     } catch (error) {
       logEvent('device-register', [clientId, error], 'error');
     }
