@@ -569,17 +569,21 @@ class NodeCrypt {
 						}
 					}
 				}
-				if (Object.keys(payloads).length > 0) {
-					const payload = this.encryptServerMessage({
-						a: 'w',
-						p: payloads,
-					}, this.serverShared);
-					if (!this.isOpen() || payload.length === 0 || payload.length > (8 * 1024 * 1024)) {
-						return (false)
-					}
-					this.connection.send(payload)
+				// 无在线 E2E 成员（payloads 为空）也必须发送：服务器借此得知"频道有消息"，
+				// 从而触发对离线注册设备的推送（杀进程/首页手机正依赖该路径接收通知）。
+				// 空封装对在线成员零影响（relay 无对象）；握手类 'w' 带 n:0 不受波及。
+				// MUST send even with an empty payloads map (no online E2E peers): the server
+				// needs to learn "message happened in channel" to notify offline registered
+				// devices (killed / home-screen phones depend on exactly this path).
+				const payload = this.encryptServerMessage({
+					a: 'w',
+					p: payloads,
+				}, this.serverShared);
+				if (!this.isOpen() || payload.length === 0 || payload.length > (8 * 1024 * 1024)) {
+					return (false)
 				}
-				return (true)
+				this.connection.send(payload)
+			return (true)
 			} catch (error) {
 				this.logEvent('sendChannelMessage', error, 'error')
 			}

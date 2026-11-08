@@ -181,7 +181,7 @@ export async function markDeviceOffline(storage, channelHash, clientId) {
 function notifyTitle(env) {
 	return (typeof (env && env.GETUI_APP_NAME) === 'string' && env.GETUI_APP_NAME.trim()) || 'NodeCrypt';
 }
-const NOTIFY_BODY = '有新消息，点击查看';
+const NOTIFY_BODY = '有新消息';
 // 点击进房兜底标记：非华为（个推离线库补投）路径的 click payload 会被个推/DCloud
 // 重组成 title/content 而丢失自定义 payload（实测），所以把房间 hash 的前 8 位放进
 // 正文 [xxxxxxxx] —— 客户端从 content 提取做前缀匹配即可进房。服务器仍不知房间名
@@ -195,7 +195,6 @@ const NOTIFY_BODY = '有新消息，点击查看';
 function notifyBody(channelHash) {
 	return `${NOTIFY_BODY} [${String(channelHash || '').slice(0, 8)}]`;
 }
-
 // 环境变量 GETUI_ANDROID_PACKAGE 必须与云打包设置的 Android 包名一致（intent 依赖它）
 // Env GETUI_ANDROID_PACKAGE must equal the Android package name set in cloud packaging
 function buildVendorNotification(env, payloadText, bodyText) {
@@ -243,8 +242,19 @@ function buildPushBody(env, channelHash, audienceCid, testMessage) {
 		// notification itself — fixes the black hole where an online "notification"
 		// message was counted delivered while the app process was dead/foreground.
 		// Killed phones: vendor offline notification banner, or offline-store redelivery.
+		// 透传 payload 采用 DCloud 本地消息三字段结构：透传被系统自动转通知时
+		// （离线库补投/ADM 后台透传），通知栏直接显示 title/content 而非整段 JSON 原文；
+		// 客户端 extractHash 兼容 payload 字段的 64 位 hash 提取。
+		// Transmission payload uses DCloud's local-message shape ({title,content,payload}):
+		// when the system auto-converts transmission into a notification (offline-store
+		// redelivery), the banner shows title/content instead of the raw JSON;
+		// extractHash already handles the nested 64-hex payload.
 		push_message: {
-			transmission: JSON.stringify({ hash: payloadText })
+			transmission: JSON.stringify({
+				title: titleText,
+				content: NOTIFY_BODY,
+				payload: payloadText
+			})
 		},
 		push_channel: {
 			android: {
