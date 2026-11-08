@@ -193,7 +193,12 @@ const NOTIFY_BODY = '有新消息';
 // room name (truncated hash, collision negligible for single-digit channel counts),
 // preserving the blind-relay design.
 function notifyBody(channelHash) {
-	return `${NOTIFY_BODY} [${String(channelHash || '').slice(0, 8)}]`;
+	// 正文尾缀加发送时刻 HH:MM：手机上可一眼区分“本轮新消息”与“离线队列/通知栏残留”
+	// （残留 payload 没有时间戳或时间已过），判代不再依赖猜测。
+	// Append the dispatch time HH:MM so any notification self-identifies whether it is
+	// a fresh message or a stale queue/tray leftover — no more guessing epochs.
+	const stamp = new Date(Date.now() + 8 * 3600 * 1000).toISOString().slice(11, 16);
+	return `${NOTIFY_BODY} [${String(channelHash || '').slice(0, 8)}] ${stamp}`;
 }
 // 环境变量 GETUI_ANDROID_PACKAGE 必须与云打包设置的 Android 包名一致（intent 依赖它）
 // Env GETUI_ANDROID_PACKAGE must equal the Android package name set in cloud packaging
