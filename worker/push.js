@@ -242,16 +242,18 @@ function buildPushBody(env, channelHash, audienceCid, testMessage) {
 		// notification itself — fixes the black hole where an online "notification"
 		// message was counted delivered while the app process was dead/foreground.
 		// Killed phones: vendor offline notification banner, or offline-store redelivery.
-		// 透传 payload 单字段 hash：DCloud 对"含 title/content 字段"的透传会转成通知渲染
-		// （前台也不再触发 receive → 客户端计数断链、角标不显示，2026-11-08 实测定案）。
-		// 单字段 hash 走"透传→JS receive"路径（前台/后台均触发 receive → 自动计数+本地通知）。
-		// 杀进程离线库补投的锁屏通知会显示 JSON 原文（已知牺牲项），点击后仍能进房并计数。
-		// Transmission payload = single-field hash. Payload containing title/content makes
-		// Getui auto-convert it into a notification (foreground receive then never fires,
-		// breaking the badge chain - confirmed on-device); the bare hash keeps the
-		// transmission→JS receive path for foreground/background badge counting.
+		// 透传 payload 用纯文本串（有新消息 [hash8]）：个推/DCloud 自动转通知时，
+		// 通知正文=整段 payload 原文 → 系统通知直接显示人话（标题=APP 名 Channel）；
+		// 实测三字段 {title,content,payload} 结构会被转成"通知"导致前台 receive 消失、
+		// 角标断链，故保持纯文本并依赖客户端 extractHash 的字符串 [hash8] 扫描
+		// （utils/push.js 已支持，需云打包生效）。
+		// Transmission payload = plain text with the [hash8] body tag: SDK-side
+		// auto-notification renders the raw payload verbatim, so human text keeps the
+		// tray readable. Fielded JSON ({title,...}) converts the transmission into a
+		// notification and kills foreground receive (badge chain - confirmed), so we
+		// rely on the client's string-TAG extraction instead (needs one cloud build).
 		push_message: {
-			transmission: JSON.stringify({ hash: payloadText })
+			transmission: notifyBody(payloadText)
 		},
 		push_channel: {
 			android: {
