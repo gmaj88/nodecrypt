@@ -200,12 +200,6 @@ function notifyBody(channelHash) {
 	const stamp = new Date(Date.now() + 8 * 3600 * 1000).toISOString().slice(11, 16);
 	return `${NOTIFY_BODY} [${String(channelHash || '').slice(0, 8)}] ${stamp}`;
 }
-// 透传 payload 极短标签：[hash8] HH:MM（厂商通知正文仍走 notifyBody 人话）
-// Tiny transmission tag: [hash8] HH:MM (vendor notification body keeps notifyBody prose)
-function notifyTag(channelHash) {
-	const stamp = new Date(Date.now() + 8 * 3600 * 1000).toISOString().slice(11, 16);
-	return `[${String(channelHash || '').slice(0, 8)}] ${stamp}`;
-}
 // 环境变量 GETUI_ANDROID_PACKAGE 必须与云打包设置的 Android 包名一致（intent 依赖它）
 // Env GETUI_ANDROID_PACKAGE must equal the Android package name set in cloud packaging
 function buildVendorNotification(env, payloadText, bodyText) {
@@ -253,16 +247,13 @@ function buildPushBody(env, channelHash, audienceCid, testMessage) {
 		// notification itself — fixes the black hole where an online "notification"
 		// message was counted delivered while the app process was dead/foreground.
 		// Killed phones: vendor offline notification banner, or offline-store redelivery.
-		// 透传 payload 用极短标签（[hash8] HH:MM）：非厂商机型（个推离线库补投）的表现层
-		// 会把 payload 重新包装成 JSON 串显示（实测），长文案放进 JSON 很难读，短标签
-		// 无论怎么重组都只占一行且可读；厂商通知正文仍用 notifyBody 人话（华为横幅）。
-		// 客户端 extractHash 的字符串 [hash8] 扫描直接兼容此格式（utils/push.js）。
-		// Transmission payload = a tiny bracket tag ([hash8] HH:MM): the display layer of
-		// non-vendor devices (Getui offline-store redelivery) rewraps the payload into a
-		// JSON string (observed), which makes long prose unreadable; a short tag stays
-		// legible under any rewrap. Vendor notification body stays human via notifyBody.
+		// 透传 payload 统一为人话（有新消息 [hash8] HH:MM）——用户定稿格式；厂商通知
+		// title/body 同源（notifyBody），所有链路正文口径一致。WIKO/OPPO 通知栏残留的
+		// 长 JSON 已证实为时代快照回放（13.10），与本 payload 无关。
+		// Transmission payload = the canonical human text (NOTIFY_BODY [hash8] HH:MM);
+		// vendor notification shares notifyBody so every path speaks the same prose.
 		push_message: {
-			transmission: notifyTag(payloadText)
+			transmission: notifyBody(payloadText)
 		},
 		push_channel: {
 			android: {
