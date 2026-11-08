@@ -234,13 +234,17 @@ function buildPushBody(env, channelHash, audienceCid, testMessage) {
 		request_id: requestId(),
 		audience: { cid: [audienceCid] },
 		settings: { ttl: 3600000, strategy: { default: 4 } },
+		// 在线个推通道改用透传：APP 进程存活（前台/后台）即触发 receive，
+		// 由客户端计数角标 + 弹本地通知 —— 修复"通知栏消息在线送达但前台不弹、
+		// APP 进程死时被吞且个推视为成功不进离线库"的消息黑洞。
+		// 杀进程场景：厂商离线通知（横幅可点直达）或离线库补投（APP 打开时 receive）。
+		// Online Getui channel uses transmission: any live app process (foreground or
+		// background) fires receive, so the client counts the badge and pops a local
+		// notification itself — fixes the black hole where an online "notification"
+		// message was counted delivered while the app process was dead/foreground.
+		// Killed phones: vendor offline notification banner, or offline-store redelivery.
 		push_message: {
-			notification: {
-				title: titleText,
-				body: bodyText,
-				click_type: 'startapp',
-				payload: payloadText
-			}
+			transmission: JSON.stringify({ hash: payloadText })
 		},
 		push_channel: {
 			android: {
@@ -385,6 +389,22 @@ export async function readNotifyLog(storage, channelHash) {
 	}
 }
 
+// 从注册表移除失效 cid（个推 20001 invalid / 手动 &forget=<cid>）
+// Drop an invalid cid from the registry (Getui 20001 invalid / manual &forget>)
+export async function removeDevice(storage, channelHash, cid) {
+	try {
+		const key = `devices:${channelHash}`;
+		const devices = (await storage.get(key)) || {};
+		if (!devices || !Object.prototype.hasOwnProperty.call(devices, cid)) return false;
+		delete devices[cid];
+		await storage.put(key, devices);
+		return true;
+	} catch (error) {
+		console.error('removeDevice error', error);
+		return false;
+	}
+}
+
 // 推送通知（不 await 结果也安全；由 DO 的 await 链路保证调度）
 // Send push notifications (safe fire-and-forget; scheduled via DO await chain)
 // source: 调用来源（'private'=私聊转发 / 'channel'=频道消息转发），仅用于日志归因
@@ -414,7 +434,14 @@ export async function notifyOfflineDevices(env, storage, channelHash, source) {
 				const json = await postGetui(env, token, cid, buildPushBody(env, channelHash, cid));
 				const delivered = vendorDelivered(json, cid);
 				const status = vendorStatus(json, cid);
-				results.push({ cid, ok: delivered, code: json ? json.code : null, msg: json ? json.msg : null, status });
+				const entry = { cid, ok: delivered, code: json ? json.code : null, msg: json ? json.msg : null, status };
+				// 死 cid 自动净化：个推 20001（用户无效=已卸载/重装残留）即时移出注册表
+				// Auto-purge dead cids: Getui 20001 (invalid user = uninstalled/stale) removed at once
+				if (json && json.code === 20001) {
+					entry.removed = true;
+					await removeDevice(storage, channelHash, cid);
+				}
+				results.push(entry);
 				if (!delivered) {
 					console.error('getui push not confirmed', cid, json && json.msg, json && JSON.stringify(json.data || json));
 				}

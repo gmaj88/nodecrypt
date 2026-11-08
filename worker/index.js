@@ -1,5 +1,5 @@
 import { generateClientId, encryptMessage, decryptMessage, logEvent, isString, isObject, getTime } from './utils.js';
-import { upsertDevice, markDeviceOffline, notifyOfflineDevices, readNotifyLog, listAllDevices, purgeDevices, debugPush, debugTaskDetail } from './push.js';
+import { upsertDevice, markDeviceOffline, notifyOfflineDevices, readNotifyLog, removeDevice, listAllDevices, purgeDevices, debugPush, debugTaskDetail } from './push.js';
 import { getVoiceTurnIceServers } from './voiceTurn.js';
 
 export default {
@@ -140,6 +140,13 @@ export class ChatRoom {  constructor(state, env) {
           // Test aid: wipe device registrations for a hash (or all) to clear stale reinstall cids
           const deleted = await purgeDevices(this.state.storage, hash);
           return new Response(JSON.stringify({ purged: true, hash: hash || 'all', removed: deleted }), { headers: { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' } });
+        }
+        if (hash && params.get('forget')) {
+          // 手动移出单个失效 cid（重装残留 20001 场景）
+          // Manually drop one invalid cid (stale reinstall residue returning 20001)
+          const cid = params.get('forget');
+          const removed = await removeDevice(this.state.storage, hash, cid);
+          return new Response(JSON.stringify({ forgot: cid, removed, hash }), { headers: { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' } });
         }
         if (params.get('report') === '1') {
           const taskid = params.get('taskid') || '';
