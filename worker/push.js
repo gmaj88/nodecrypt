@@ -513,7 +513,9 @@ export async function purgeDevices(storage, channelHash) {
 
 // 推送调试变体：返回完整过程数据（设备清单/鉴权结果/每个 cid 的个推响应原文）
 // Debug variant of push: full process data (device list / auth result / per-cid Getui response)
-export async function debugPush(env, storage, channelHash, testMessage) {
+// targetCid: 可选，仅推送该 cid（单机取证，如真华为杀进程横幅对照）
+// targetCid: optional, push to one cid only (single-device diagnosis)
+export async function debugPush(env, storage, channelHash, testMessage, targetCid) {
 	try {
 		if (!isConfigured(env)) {
 			const bindings = {
@@ -531,9 +533,13 @@ export async function debugPush(env, storage, channelHash, testMessage) {
 			const record = devices[cid];
 			deviceList.push({ cid, online: record.online ? true : false, seenAt: record.seen || null, fresh: Boolean(record.seen && now - record.seen <= deviceRecordTtl) });
 		}
-		const offlineTokens = await listOfflineDevices(storage, channelHash);
+		const offlineTokensAll = await listOfflineDevices(storage, channelHash);
+		const offlineTokens = targetCid
+			? offlineTokensAll.filter((t) => t === targetCid)
+			: offlineTokensAll;
 		const result = {
 			channelHash,
+			targetedCid: targetCid || null,
 			deviceCount: deviceList.length,
 			devices: deviceList,
 			offlineTokens: offlineTokens.length,

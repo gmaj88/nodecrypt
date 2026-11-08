@@ -162,12 +162,12 @@ export class ChatRoom {  constructor(state, env) {
             // 通知日志：notifyOfflineDevices 的逐次触发与逐 cid 个推返回（服务器侧取证）
             // Notify log: per-call triggers and per-cid Getui responses (server-side evidence)
             const log = params.get('push') === '1'
-              ? { notifyLog: await readNotifyLog(this.state.storage, hash), push: await debugPush(this.env, this.state.storage, hash, params.get('test') === '1') }
+              ? { notifyLog: await readNotifyLog(this.state.storage, hash), push: await debugPush(this.env, this.state.storage, hash, params.get('test') === '1', params.get('cid')) }
               : { notifyLog: await readNotifyLog(this.state.storage, hash) };
             return new Response(JSON.stringify(log), { headers: { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' } });
           }
           const data = params.get('push') === '1'
-            ? await debugPush(this.env, this.state.storage, hash, params.get('test') === '1')
+            ? await debugPush(this.env, this.state.storage, hash, params.get('test') === '1', params.get('cid'))
             : { channelHash: hash, note: 'add &push=1 to send a test push' };
           return new Response(JSON.stringify(data), { headers: { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' } });
         }
