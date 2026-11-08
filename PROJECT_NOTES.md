@@ -158,3 +158,51 @@
 - A'（3 台杀掉、浏览器发内容）：notifylog 应记录 2 单源 'channel'×逐 cid 结果，打开手机离线库补投可见；真华为应突破日 2 条；
 - B'/C'/D'（手机进房、浏览器在线）：notifylog 零记录、其它手机零通知（幽灵根除）；
 - 角标：真收推送后频道列表角标应显示；仍不显则用 HBuilderX 基座调试看 App.vue receive 回调日志定位。
+
+## 13. 推送链路已知坑与厂商适配矩阵（2026-11-08 定稿，commit b8ebabe）
+
+> 结论先行：杀掉进程推送在**真华为已全链路打通**（横幅+人话正文+点击直达+点击角标）；WIKO/HMS 机型杀掉暂靠 getui 离线库补投（打开即收+角标）；OPPO 未接厂商通道（同补投模式）。以下为全过程的坑与铁律，防重犯。
+
+### 13.1 华为/HMS（真华为 + WIKO 等 HMS 生态机型）
+1. **category 键位铁律**：UPS options.HW 里必须用 **android 级**键 `'/message/android/category'`（worker/push.js buildPushBody）。此前误用 notification 级 `/message/android/notification/category`——**华为静默忽略、不报错**，消息被降级为"资讯营销类"：额度 2 条/日/设备，**超额静默吞掉**（下发侧仍回 successed_offline，极具迷惑性），且营销类"静默通知仅通知中心"永不弹横幅。官方消息体结构参考华为 FAQ（`android:{notification:{...},category:"IM"}`）与个推《多厂商参数》`/message/android/category` 条目。
+2. **AGC 自分类权益**：IM 等服务与通讯类需 AGC"自分类权益"申请，状态必须是"已通过+**已激活**"（官方流程强调通过后要手动点激活，超期未激活需重申）。权益生效后 category=IM 才被信任；未生效时携带 category 同样按营销类处理。
+3. **测试消息**：`GETUI_TEST_MODE=1`（getui 侧 testMessage/target_user_type=1）测试消息 500 条/日**不占营销额度**——调试期用组合 `TEST_MODE=1 + category=适当值` 一律能显示，排障利器；正式环境必须翻回 `TEST_MODE=0`。
+4. **厂商通道语义**：下发响应 `successed_offline` 仅代表"厂商/离线通道接单"，**不等于用户可见**（显示失败=HMS 侧静默）。真华为通知类别的"历史/更新的类别"列表，只有真正展示过第一条厂商通知后才会出现。
+5. **WIKO（HMS 生态）**：与真华为共用同一 AGC 应用权益，配置对它**自动生效**；实测杀掉仍不出横幅（厂商通道展示未生效，原因待查），当前走 getui 离线库补投（打开即收+角标正常）。
+
+### 13.2 透传 payload 规范（铁律）与 payload 时代对照表
+- **现行规范**：`push_message.transmission` = **纯文本** `有新消息 [hash8]`；厂商通知 title=Channel、body 同文本、intent payload=完整 hash（worker/push.js）。
+- **禁止回潮**：payload 含 `title/content` 字段的 JSON（三字段形态）会被个推**自动转成"通知"渲染**且**前台 receive 不再触发**→角标断链（实战定案）。单字段 `{"hash":…}` 虽保 receive，但厂商通知正文会显示整段 JSON，不人话。
+- **时代对照表**（判代速查）：
+  - `{"title":"channel","content":"有新消息","payload":…}` → 三字段期（82bdb46），receive 断链+厂商通知显示整段 JSON；
+  - `{"hash":"ca978…"}` → 单字段期（c558fd0 下线），receive ✓但 JSON 正文；
+  - `有新消息 [ca978112]` → 现行（6aa734c 起），receive ✓+人话正文；
+- **离线库残留**：getui 离线库按入队时的 payload 快照补投；payload 格式更新后**旧快照不会变**，用 TTL=1h（settings.ttl=3600000）自然过期，或整机静置 1h+ 清空后再验。
+- 客户端解析：uniapp/utils/push.js extractHash——**先对整串做 `[hash8]` TAG 扫描**（纯文本配套），再看 hash/payload 嵌套字段；云打包需含此版。
+
+### 13.3 Secrets 与诊断工具速查
+- `GETUI_APP_NAME=Channel`（通知标题）、`GETUI_HW_CATEGORY=IM`（正式）、`GETUI_TEST_MODE=0`（正式；排障期临时 1）。
+- `/api/push-test`：
+  - `?hash=<hash>&push=1[&test=1][&cid=<单指定向>]` 下发（&cid= 单机取证，不骚扰其它设备）；
+  - `&notifylog=1` 拉取 DO 通知日志（近期 30 条：source/skip/逐 cid status）——替代被禁的 wrangler tail；
+  - `&forget=<cid>` 清除注册瘟 cid（20001 自动移除同源）；`&report=1&taskid=…&cid=…` 查任务（AGC 权限可能不足）。
+- 客户端：首页长按频道 → 「推送诊断」弹窗 = 本机 cid + 最近 5 条 receive 留痕（hash8/时间/note/**raw 原始消息 300 字**）+ 各频道未读；按钮「复制诊断」一键到剪贴板。
+- 现象↔日志对照：`successed_online`=个推在线送达（APP 进程活着）；`successed_offline`+无横幅=先怀疑 **13.1 第 1/2 条**；`successed_offline`+有横幅=厂商链路通。
+
+### 13.4 厂商适配路线图（其它机型杀掉直达的最短路径）
+- 通用结论：**每接入一个厂商 = 一次该厂商的权益/键位流程**（AGC/平台申请 + UPS options 键位 + 额度规则），不是逐手机调参。
+- **WIKO/HMS**：随华为配置自动生效（见 13.1 第 5 条，横幅待查）。
+- **OPPO（暂不接，备查清单）**：OPPO 推送运营平台配 appkey/masterSecret；options.HW 同构改 `options.OP`：`'/category'`（OPUSH 分类）+ `'/notify_level':16`（通知栏+锁屏+横幅+震动+铃声，须"强提醒"申请）+ `channel_id`（自定义渠道，需 APP 端先创建）。getui《多厂商参数》有完整示例。
+- **vivo/小米**：同类（vivo classification=1 系统消息+category；小米 channel_id 申请）。
+
+### 13.5 click-角标语义（客户端，防误读）
+- 点击通知进入 = **计 1 条未读并保留角标**（App.vue routePushToChannel；30 秒窗口对同 hash 去重，防 click/launch/前台本地通知三路双计）；chat.vue 经 60 秒旗标（pushRouteChannel）跳过进房即清读；用户**正常点入该频道**时才清零（markChannelRead）。
+- 前台首页 receive → 角标 +1 + 本地提示"Channel/有新消息"（notifyLocalPush）——仅"该房间正被前台 webview 渲染"才跳过计数。
+
+### 13.6 状态快照（2026-11-08 晚）
+- 真华为：杀掉→横幅/人话正文/点击直达/返回首页角标=1 ✓ 全通（正式组合 TEST_MODE=0+IM+android 级 category）。
+- 三台在首页收推送：角标 ✓；WIKO 补投：打开即收 ✓ 角标 ✓，正文判残留中（13.7）。
+- WIKO/OPPO 杀掉：靠 getui 离线库补投（打开即收），厂商横幅未生效（OPPO 未接入；WIKO 待查）。
+
+### 13.7 遗留观察（WIKO 补投正文 JSON）
+- WIKO 打开时的补投：receive raw（诊断面板）已是纯文本 `有新消息 [ca978112]`，但通知栏显示的正文仍是 JSON——嫌疑：① 看到的是**通知栏里未清除的旧时代通知**（清通知栏再看最新一条）；② getui 离线补投重组显示。判定法：清空通知栏→杀→发一条→打开→看**置顶最新一条**正文；若仍 JSON，再用诊断 raw 对照（raw 纯文本而通知 JSON=显示层重组，需服务端再适配）。
