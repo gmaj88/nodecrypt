@@ -1,5 +1,5 @@
 import { generateClientId, encryptMessage, decryptMessage, logEvent, isString, isObject, getTime } from './utils.js';
-import { upsertDevice, markDeviceOffline, notifyOfflineDevices, listAllDevices, purgeDevices, debugPush, debugTaskDetail } from './push.js';
+import { upsertDevice, markDeviceOffline, notifyOfflineDevices, readNotifyLog, listAllDevices, purgeDevices, debugPush, debugTaskDetail } from './push.js';
 import { getVoiceTurnIceServers } from './voiceTurn.js';
 
 export default {
@@ -151,6 +151,14 @@ export class ChatRoom {  constructor(state, env) {
           return new Response(JSON.stringify(data), { headers: { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' } });
         }
         if (hash) {
+          if (params.get('notifylog') === '1') {
+            // 通知日志：notifyOfflineDevices 的逐次触发与逐 cid 个推返回（服务器侧取证）
+            // Notify log: per-call triggers and per-cid Getui responses (server-side evidence)
+            const log = params.get('push') === '1'
+              ? { notifyLog: await readNotifyLog(this.state.storage, hash), push: await debugPush(this.env, this.state.storage, hash, params.get('test') === '1') }
+              : { notifyLog: await readNotifyLog(this.state.storage, hash) };
+            return new Response(JSON.stringify(log), { headers: { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' } });
+          }
           const data = params.get('push') === '1'
             ? await debugPush(this.env, this.state.storage, hash, params.get('test') === '1')
             : { channelHash: hash, note: 'add &push=1 to send a test push' };
@@ -438,9 +446,18 @@ export class ChatRoom {  constructor(state, env) {
 
         messageObj.p = null;
 
+        // 幽灵通知根治：控制类封装（握手/密钥交换/语音信令）带 n:0 标记——只转发不推送。
+        // 只有未标记的内容类封装（私聊/频道消息）才触发离线设备通知。
+        // Ghost-notification fix: control wrappers (handshake / key exchange / voice
+        // signaling) carry n:0 - relay only, no push. Unmarked (content) wrappers
+        // (private / channel messages) still notify offline devices.
+        if (decrypted.n === 0) {
+          return;
+        }
+
         // 私聊消息转发后，对本频道离线注册设备触发通知（不包含任何明文）
         // After relaying a private message, notify offline registered devices of the channel (no plaintext)
-        await notifyOfflineDevices(this.env, this.state.storage, channel);
+        await notifyOfflineDevices(this.env, this.state.storage, channel, 'private');
       }
 
     } catch (error) {
@@ -473,9 +490,15 @@ export class ChatRoom {  constructor(state, env) {
         messageObj.p = null;
       }
 
+      // 幽灵通知根治：控制类封装（进房公钥广播）带 n:0 标记——只转发不推送。
+      // Ghost-notification fix: control wrappers (join key broadcast) carry n:0 - relay only.
+      if (decrypted.n === 0) {
+        return;
+      }
+
       // 房间消息转发后，对本频道离线注册设备触发通知（不包含任何明文）
       // After relaying a channel message, notify offline registered devices of the channel (no plaintext)
-      await notifyOfflineDevices(this.env, this.state.storage, channel);
+      await notifyOfflineDevices(this.env, this.state.storage, channel, 'channel');
 
     } catch (error) {
       logEvent('message-channel', [clientId, error], 'error');

@@ -143,8 +143,10 @@ export class VoiceChat {
 				{ a: 'm', t: type, d: data || {} },
 				peer.shared
 			);
+			// n:0 = 控制类封装：服务器只转发，不触发离线设备推送（防幽灵通知）
+			// n:0 = control wrapper: server relays only, no offline-device push
 			const serverPayload = chat.encryptServerMessage(
-				{ a: 'c', p: clientPayload, c: targetId },
+				{ a: 'c', n: 0, p: clientPayload, c: targetId },
 				chat.serverShared
 			);
 			chat.sendMessage(serverPayload);

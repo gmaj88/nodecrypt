@@ -175,7 +175,12 @@ export async function markDeviceOffline(storage, channelHash, clientId) {
 // "not received when killed, arrives on open" symptom. click_type:'intent' (DCloud
 // fixed format) is the only reliable way to carry payload through vendor clicks;
 // S.payload feeds the 5+ Push payload verbatim (the room hash - zero plaintext).
-const NOTIFY_TITLE = 'NodeCrypt';
+// 通知标题：默认 NodeCrypt，可通过环境变量 GETUI_APP_NAME 覆盖（APP 改名后服务端标题需同步）。
+// Notification title: defaults to NodeCrypt, overridable via env GETUI_APP_NAME
+// (must follow the app's display name change).
+function notifyTitle(env) {
+	return (typeof (env && env.GETUI_APP_NAME) === 'string' && env.GETUI_APP_NAME.trim()) || 'NodeCrypt';
+}
 const NOTIFY_BODY = '有新消息，点击查看';
 // 点击进房兜底标记：非华为（个推离线库补投）路径的 click payload 会被个推/DCloud
 // 重组成 title/content 而丢失自定义 payload（实测），所以把房间 hash 的前 8 位放进
@@ -206,7 +211,7 @@ function buildVendorNotification(env, payloadText, bodyText) {
 			intent:
 				`intent://io.dcloud.unipush/?#Intent;scheme=unipush;launchFlags=0x4000000;` +
 				`component=${pkg}/io.dcloud.PandoraEntry;S.UP-OL-SU=true;` +
-				`S.title=${NOTIFY_TITLE};S.content=${bodyText};S.payload=${payloadText};end`
+				`S.title=${notifyTitle(env)};S.content=${bodyText};S.payload=${payloadText};end`
 		};
 	} catch (error) {
 		return { click_type: 'startapp' };
@@ -223,6 +228,7 @@ function buildVendorNotification(env, payloadText, bodyText) {
 function buildPushBody(env, channelHash, audienceCid, testMessage) {
 	const payloadText = channelHash;
 	const bodyText = notifyBody(channelHash);
+	const titleText = notifyTitle(env);
 	const vendorNotification = buildVendorNotification(env, payloadText, bodyText);
 	const body = {
 		request_id: requestId(),
@@ -230,7 +236,7 @@ function buildPushBody(env, channelHash, audienceCid, testMessage) {
 		settings: { ttl: 3600000, strategy: { default: 4 } },
 		push_message: {
 			notification: {
-				title: NOTIFY_TITLE,
+				title: titleText,
 				body: bodyText,
 				click_type: 'startapp',
 				payload: payloadText
@@ -240,7 +246,7 @@ function buildPushBody(env, channelHash, audienceCid, testMessage) {
 			android: {
 				ups: {
 					notification: Object.assign({
-						title: NOTIFY_TITLE,
+						title: titleText,
 						body: bodyText
 					}, vendorNotification),
 					// 华为通知自分类权益：服务端必须携带 category（"即时聊天"=IM）才会按
@@ -262,7 +268,7 @@ function buildPushBody(env, channelHash, audienceCid, testMessage) {
 				type: 'notify',
 				payload: payloadText,
 				aps: {
-					alert: { title: NOTIFY_TITLE, body: bodyText },
+					alert: { title: titleText, body: bodyText },
 					'content-available': 0
 				},
 				auto_badge: '+1'
@@ -349,36 +355,78 @@ async function postGetui(env, token, cid, body) {
 	return json;
 }
 
+// 通知日志：滚动记录每次 notifyOfflineDevices 的触发、跳过原因与逐 cid 个推返回
+// （服务器侧留痕替代被网络封禁的 wrangler tail，用 /api/push-test?hash=x&notifylog=1 拉取）
+// Notify log: ring buffer of every notifyOfflineDevices invocation (skip reasons and
+// per-cid Getui responses). Server-side evidence in place of wrangler tail;
+// fetch via /api/push-test?hash=x&notifylog=1
+const NOTIFY_LOG_LIMIT = 30;
+
+async function appendNotifyLog(storage, channelHash, entry) {
+	try {
+		const key = `notify-log:${channelHash}`;
+		const log = (await storage.get(key)) || [];
+		log.unshift(Object.assign({ ts: Date.now() }, entry));
+		await storage.put(key, log.slice(0, NOTIFY_LOG_LIMIT));
+	} catch (error) {
+		console.error('appendNotifyLog error', error);
+	}
+}
+
+// 拉取通知日志（调试端点用；无 hash 返回 null）
+// Fetch the notify log (debug endpoint; null without hash)
+export async function readNotifyLog(storage, channelHash) {
+	try {
+		if (!channelHash) return null;
+		return (await storage.get(`notify-log:${channelHash}`)) || [];
+	} catch (error) {
+		console.error('readNotifyLog error', error);
+		return [];
+	}
+}
+
 // 推送通知（不 await 结果也安全；由 DO 的 await 链路保证调度）
 // Send push notifications (safe fire-and-forget; scheduled via DO await chain)
-export async function notifyOfflineDevices(env, storage, channelHash) {
+// source: 调用来源（'private'=私聊转发 / 'channel'=频道消息转发），仅用于日志归因
+// source: call origin ('private' / 'channel'), used only for log attribution
+export async function notifyOfflineDevices(env, storage, channelHash, source) {
 	if (!isConfigured(env)) {
 		return;
 	}
+	const sourceLabel = source || 'unknown';
 	try {
 		const tokens = await listOfflineDevices(storage, channelHash);
 		if (tokens.length === 0) {
+			await appendNotifyLog(storage, channelHash, { source: sourceLabel, skip: 'no-offline-devices' });
 			return;
 		}
 		const token = await getGetuiToken(env, storage);
 		if (!token) {
+			await appendNotifyLog(storage, channelHash, { source: sourceLabel, skip: 'auth-failed', devices: tokens });
 			return;
 		}
+		const results = [];
 		for (const cid of tokens) {
 			try {
 				// 策略 4：厂商离线通道优先，失败由个推自动落回个推离线库（打开 APP 补投）
 				// Strategy 4: vendor channel first, Getui auto-falls back to its offline
 				// store (redelivered when the app opens) if the vendor send fails.
 				const json = await postGetui(env, token, cid, buildPushBody(env, channelHash, cid));
-				if (!vendorDelivered(json, cid)) {
+				const delivered = vendorDelivered(json, cid);
+				const status = vendorStatus(json, cid);
+				results.push({ cid, ok: delivered, code: json ? json.code : null, msg: json ? json.msg : null, status });
+				if (!delivered) {
 					console.error('getui push not confirmed', cid, json && json.msg, json && JSON.stringify(json.data || json));
 				}
 			} catch (error) {
+				results.push({ cid, ok: false, error: String(error && error.message || error) });
 				console.error('getui push error', cid, error);
 			}
 		}
+		await appendNotifyLog(storage, channelHash, { source: sourceLabel, devices: tokens.length, results });
 	} catch (error) {
 		console.error('notifyOfflineDevices error', error);
+		await appendNotifyLog(storage, channelHash, { source: sourceLabel, error: String(error && error.message || error) });
 	}
 }
 

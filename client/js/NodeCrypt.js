@@ -321,8 +321,11 @@ class NodeCrypt {
 					}
 				}
 				if (Object.keys(payloads).length > 0) {
+					// n:0 = 控制类封装：服务器只转发，不触发离线设备推送（防幽灵通知）
+					// n:0 = control wrapper: server relays only, no offline-device push
 					this.sendMessage(this.encryptServerMessage({
 						a: 'w',
+						n: 0,
 						p: payloads,
 					}, this.serverShared))
 				}
@@ -358,8 +361,11 @@ class NodeCrypt {
 						keys: this.clientEc.genKeyPair(),
 						shared: null,
 					};
+					// n:0 = 控制类封装：服务器只转发，不触发离线设备推送（防幽灵通知）
+					// n:0 = control wrapper: server relays only, no offline-device push
 					this.sendMessage(this.encryptServerMessage({
 						a: 'c',
+						n: 0,
 						p: this.channel[serverDecrypted.c].keys.getPublic('hex'),
 						c: serverDecrypted.c
 					}, this.serverShared))
@@ -367,6 +373,7 @@ class NodeCrypt {
 				this.channel[serverDecrypted.c].shared = Buffer.from(this.xorHex(this.channel[serverDecrypted.c].keys.derive(this.clientEc.keyFromPublic(serverDecrypted.p, 'hex').getPublic()).toString('hex').padEnd(64, '8').substr(0, 64), this.credentials.password), 'hex');
 				this.sendMessage(this.encryptServerMessage({
 					a: 'c',
+					n: 0,
 					p: this.encryptClientMessage({
 						a: 'u',
 						p: this.credentials.username
