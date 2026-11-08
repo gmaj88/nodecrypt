@@ -126,3 +126,35 @@
 - **荣耀**：设置→应用→应用启动管理→全部允许；省电优化→允许后台运行。
 - 通用：多任务里锁后台；通知管理→允许锁屏/横幅通知。
 不推荐：前台服务常驻保活（体验差且仍被新 ROM 杀）、双进程/JobScheduler（15 分钟级延迟，做不了即时消息）。
+
+## 12. 幽灵通知根治与通知日志（2026-11-08，commit 6a350f1）
+
+### 12.1 幽灵通知机制（B/C/D 现象实证）
+"手机进聊天室 → 其它手机收到 1/4 条推送"的真正源头：E2E 握手借道消息转发通道。
+- 进房时客户端向频道内在线成员发送密钥交换封装（`a:'w'` 公钥广播、`a:'c'` 握手/username、语音信令 `a:'c'`）；
+- 服务端转发成功即无条件 `notifyOfflineDevices` → 所有注册离线设备各收一条 "NodeCrypt/有新消息 [hash8]"；
+- 推送条数=当时握手中继条数（B=1、C/D=4 稳定复现），与"无人发消息"无关。
+
+### 12.2 修复：`n:0` 意图标记
+- **控制类**在加密前 wrapper 加 `n: 0`（NodeCrypt.js 握手/w 公钥广播；util.voice.js 信令）；服务端 `decrypted.n === 0` 时只转发、跳过推送（index.js 两处 notify 调用点）；
+- **内容类**（私聊文本/图片/文件 main.js 三处、频道消息 sendChannelMessage）不加标记 → 默认照常推送；
+- 兼容性：旧客户端不带标记 → 行为与原来相同（不会丢推送）；webview 每次打开即加载最新 client js，即时生效，无需重新云打包。
+
+### 12.3 服务端通知标题 env 化
+`push.js` 常量 `NOTIFY_TITLE='NodeCrypt'` → `notifyTitle(env)`：`GETUI_APP_NAME` 缺省 'NodeCrypt'。
+新 secret：`GETUI_APP_NAME=Channel`（APP 改名后推送标题同步为 Channel）。
+
+### 12.4 通知日志（替代被网络封禁的 wrangler Tail）
+- `notifyOfflineDevices` 新增 `source` 参数（'private'/'channel'）；
+- 每次触发滚动记录到 DO storage `notify-log:{hash}`（上限 30 条：ts、source、skip 原因、devices、逐 cid {ok,code,msg,status}）；
+- 拉取：`/api/push-test?hash=<hash>&notifylog=1`（可叠加 `&push=1` 同时返回实时推送诊断）。
+
+### 12.5 Secrets 现状（2026-11-08）
+- `GETUI_HW_CATEGORY=IM`（纠正 MARKETING，华为 IM 权益计频；营销类 2 条/日/设备 额度解除）；
+- `GETUI_TEST_MODE=0`（关闭测试通道，恢复正式下发语义）；
+- `GETUI_APP_NAME=Channel`。
+
+### 12.6 后续验证矩阵（notifylog 对照）
+- A'（3 台杀掉、浏览器发内容）：notifylog 应记录 2 单源 'channel'×逐 cid 结果，打开手机离线库补投可见；真华为应突破日 2 条；
+- B'/C'/D'（手机进房、浏览器在线）：notifylog 零记录、其它手机零通知（幽灵根除）；
+- 角标：真收推送后频道列表角标应显示；仍不显则用 HBuilderX 基座调试看 App.vue receive 回调日志定位。
