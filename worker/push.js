@@ -268,13 +268,18 @@ function buildPushBody(env, channelHash, audienceCid, testMessage) {
 					// Huawei self-classification right: the message MUST carry category
 					// ("im" scenario = IM), otherwise it falls back to the marketing class
 					// with a 2/day/device rate limit even after the right is approved.
-					options: {
-						HW: {
-							'/message/android/notification/category': hwCategory(env),
-							'/message/android/notification/badge/class': 'io.dcloud.PandoraEntry',
-							'/message/android/notification/badge/add_num': 1
-						}
+				options: {
+					HW: {
+						// category lives at the android level of the HMS message body
+						// (per getui doc & Huawei FAQ sample: android.category = "IM").
+						// The notification-level key was silently ignored by the vendor
+						// pipeline, so the right was never honored and messages were
+						// rate-limited as marketing class.
+						'/message/android/category': hwCategory(env),
+						'/message/android/notification/badge/class': 'io.dcloud.PandoraEntry',
+						'/message/android/notification/badge/add_num': 1
 					}
+				}
 				}
 			},
 			ios: {
