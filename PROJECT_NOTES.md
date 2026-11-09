@@ -147,6 +147,8 @@ localStorage.removeItem('nodecrypt-debug');     // 关（默认）
 - `manifest.json`：`"unipush": {"version": "1", "offline": true}`——**offline:true 不可丢**（决定云打包是否集成厂商组件）。
 - 通知点击：click 事件 + `checkLaunchMessage`（冷启动兜底）双路；hash 提取失败时仅调试开关（`uni.setStorageSync('@nodecrypt/debug',1)`）下弹诊断窗。
 - 频道列表顶角"删除"图标已按用户要求移除（保留长按菜单）。
+- **长按菜单（2026-11-09）：`打开/修改昵称/删除`**——"修改频道名"已**永久移除**（改名=重算 hash=实质换新房间，两台手机改名后互相看不到；教训：频道唯一标识是房间名+密码，不要做改名功能）；"推送诊断"经 `SHOW_PUSH_DIAG` 开关隐藏（index.vue 顶部，代码保留随时恢复）。
+- 菜单实现用"动作名→函数"映射（勿用固定 tapIndex，删项后索引会错位）。
 
 ## 7. 性能
 - `client/public/_headers`：`/assets/*` immutable 一年缓存（Workers Static Assets 支持），减少 APP 内打开慢。
@@ -261,12 +263,12 @@ localStorage.removeItem('nodecrypt-debug');     // 关（默认）
 5. **WIKO（HMS 生态）**：与真华为共用同一 AGC 应用权益，配置对它**自动生效**；实测杀掉仍不出横幅（厂商通道展示未生效，原因待查），当前走 getui 离线库补投（打开即收+角标正常）。
 
 ### 13.2 透传 payload 规范（铁律）与 payload 时代对照表
-- **现行规范**：`push_message.transmission` = **纯文本** `有新消息 [hash8]`；厂商通知 title=Channel、body 同文本、intent payload=完整 hash（worker/push.js）。
+- **现行规范**：`push_message.transmission` = **纯文本** `有新消息 [hash12] YYYY-MM-DD HH:MM`（12 位 tag + 日期时间戳，见 13.13）；厂商通知 title=Channel、body 同文本、intent payload=完整 hash（worker/push.js）。
 - **禁止回潮**：payload 含 `title/content` 字段的 JSON（三字段形态）会被个推**自动转成"通知"渲染**且**前台 receive 不再触发**→角标断链（实战定案）。单字段 `{"hash":…}` 虽保 receive，但厂商通知正文会显示整段 JSON，不人话。
 - **时代对照表**（判代速查）：
   - `{"title":"channel","content":"有新消息","payload":…}` → 三字段期（82bdb46），receive 断链+厂商通知显示整段 JSON；
   - `{"hash":"ca978…"}` → 单字段期（c558fd0 下线），receive ✓但 JSON 正文；
-  - `有新消息 [ca978112]` → 现行（6aa734c 起），receive ✓+人话正文；
+  - `有新消息 [ca978112]` → 现行（6aa734c 起；2026-11-09 起升级为 `[hash12]`+日期，即 `有新消息 [ca978112ca1b] 2026-11-09 21:05`）；
 - **离线库残留**：getui 离线库按入队时的 payload 快照补投；payload 格式更新后**旧快照不会变**，用 TTL=1h（settings.ttl=3600000）自然过期，或整机静置 1h+ 清空后再验。
 - 客户端解析：uniapp/utils/push.js extractHash——**先对整串做 `[hash8]` TAG 扫描**（纯文本配套），再看 hash/payload 嵌套字段；云打包需含此版。
 
@@ -287,7 +289,8 @@ localStorage.removeItem('nodecrypt-debug');     // 关（默认）
 
 ### 13.5 click-角标语义（客户端，防误读）
 - 点击通知进入 = **计 1 条未读并保留角标**（App.vue routePushToChannel；30 秒窗口对同 hash 去重，防 click/launch/前台本地通知三路双计）；chat.vue 经 60 秒旗标（pushRouteChannel）跳过进房即清读；用户**正常点入该频道**时才清零（markChannelRead）。
-- 前台首页 receive → 角标 +1 + 本地提示"Channel/有新消息"（notifyLocalPush）——仅"该房间正被前台 webview 渲染"才跳过计数。
+- **receive→click 双计修复（2026-11-09）**：receive 计数时记 `receiveCountedAt[hash前8位]`（内存级），click 计数前检查——同 key **5 分钟内已由 receive 计数则跳过**。此前踩坑：补投 1 条 → 打开角标 1 → 点本地通知 → 知 path 再 +1 → 返首页 2。厂商冷启动点击（进程重启内存无标记）不受影响，照常计 1。
+- 前台首页 receive → 角标 +1 + 本地提示（notifyLocalPush）——仅"该房间正被前台 webview 渲染"才跳过计数。
 
 ### 13.6 状态快照（2026-11-08 晚）
 - 真华为：杀掉→横幅/人话正文/点击直达/返回首页角标=1 ✓ 全通（正式组合 TEST_MODE=0+IM+android 级 category）。
@@ -328,3 +331,9 @@ localStorage.removeItem('nodecrypt-debug');     // 关（默认）
 - **为何与机型无关**：这段本机通知代码在"APP 存活收到消息"时一律执行（前台首页计数路径 + 打开补投路径），与服务端 payload、个推离线库、厂商通道全部无关；厂商横幅（华为）抢占了注意力，导致 WIKO/OPPO（无横幅）暴露了 JSON。正文无时间戳、payload 是完整 64 位 hash，都来自客户端硬编码与服务端透传 payload 是两回事。
 - **修复（App.vue）**：`notifyLocalPush(target, msg)` 按签名三参传值——content=推送原始正文（服务端人话+时间戳，异常形态兜底'有新消息'）、payload=频道完整 hash（click 事件 extractHash 直接命中，点击直达修复）、options={title:'Channel',cover:true,autoCancel:true}；震动改为调用后直接 `uni.vibrateLong()`（此前从未生效）。
 - **排查教训**：诊断面板 raw 与通知栏正文是**两条不同来源**（透传 vs 本机通知），比对时必须分别取值；"某种数据结构反复出现"先查**本进程代码现造**的可能，再查外部缓存/服务端——"重装仍复现"本应立刻排除一切本地缓存假说（本可以更早破案，D 测试后重装提醒了这一点）。
+
+### 13.13 hash tag 8→12 位 + 日期时间戳（2026-11-09 定稿）
+- **正文格式**：`有新消息 [hash12] YYYY-MM-DD HH:MM`（+8 时区，例 `有新消息 [ca978112ca1b] 2026-11-09 21:05`）——12 位 tag 定案 + 全通知带日期（聊天室内容不变，仅推送链路）。
+- **为什么 8→12**：8 位=32-bit，恶意构造同名碰撞分钟级（后果仅路由串频道，不泄密）；12 位=48-bit——几千频道撞车率 ~10⁻⁹、10 万频道 ~0.002%、50% 撞车需 ~2000 万频道；16 位（64-bit 恶意构造不可行）被否决（正文收益比 12 位只多 4 字符）。
+- **客户端兼容策略**：`TAG_RE`/`resolveChannel` 接受 **8–64 位 hex**（新 12 位、旧 8 位残留通知、厂商 intent 64 位 payload 全吃）；`store.js incrementUnreadByHash` 加 8–64 位前缀解析（厂商点击回退用正文 tag 时计数不再静默失效）。
+- **过渡期**：旧 APK（固定 8 位 TAG_RE）遇 12 位 tag 解析失败 → 回退"单频道"兜底（`resolveChannel` 单频道规则）。部署顺序：服务端 12 位随 git push 生效，手机尽快重打包；全部重打包后过渡即完结。
