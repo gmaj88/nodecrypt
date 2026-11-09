@@ -521,7 +521,7 @@ export function generateLoginForm(isModal = false) {
 			<input id="roomName${idPrefix}" type="text" required minlength="1" maxlength="15" placeholder="">
 			<label for="roomName${idPrefix}" class="floating-label">${t('ui.node_name', 'Node Name')}</label>
 		</div>
-		<div style="font-size:12px;color:#8a8f98;margin:-8px 0 10px;text-align:left;">${t('ui.password_auto_hint', 'Password is generated automatically — join by sharing the link')}</div>
+		<div style="font-size:12px;color:#8a8f98;margin:-8px 0 10px;text-align:center;">${t('ui.password_auto_hint', '[ Password will be generated automatically — invite friends via share link ]')}</div>
 		<div class="input-group" style="display:none;">
 			<input id="password${idPrefix}" type="password" autocomplete="off" maxlength="15" placeholder="">
 			<label for="password${idPrefix}" class="floating-label">${t('ui.node_password', 'Node Password')} <span class="optional">${t('ui.optional', '(optional)')}</span></label>
