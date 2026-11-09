@@ -1,12 +1,53 @@
 # NodeCrypt 维护者手册（PROJECT_NOTES）
 
-> 更新：2026-11-07。供换设备 / 他人接手使用。
+> 更新：2026-11-09（凭据线上取证核实、§4 重写）。供换设备 / 他人接手使用。
 
-## 1. 架构速览
+## 1. 项目是什么
+
+	端到端加密（E2EE）匿名聊天系统，支持文字/语音通话/离线推送通知（含 APP 杀进程场景）。由三部分组成：
+	
+	| 部分 | 说明 | 部署位置 |
+	|---|---|---|
+	| `client/` | 纯 ES6 网页端（Vite 构建，无框架），聊天页 + 语音通话 | Cloudflare Workers 静态资源（`env.ASSETS`） |
+	| `worker/` | 服务端：WebSocket 信令 + ChatRoom Durable Object + 推送/TURN 辅助 API | Cloudflare Workers |
+	| `uniapp/` | Android/iOS 壳 APP（HBuilderX 工程）：首页频道列表 + web-view 内嵌网页端 + uniPush 推送监听 + 角标 | HBuilderX 云打包，**不入 git（被 .gitignore 忽略）** |
+	
+	生产地址：`https://ai.aiui.de5.net`（自定义域名，指向同一个 worker；`https://nodecrypt.gmaj88.workers.dev` 为默认 workers.dev 地址）。
+	
+### 1.1 架构速览
 - `worker/`：Cloudflare Worker（Durable Object `ChatRoom` 承载 WS 房间；静态资源 `dist/`）。
 - `client/`：网页前端（Vite 构建 → `dist/`）。
 - `uniapp/`：APP 壳（gitignore，不入库）。内嵌 webview 打开站点；`uniapp/utils/push.js` 注册 uniPush 1.0。
 - 部署：`npm run build && npm run deploy`（wrangler）。生产域名 `https://ai.aiui.de5.net`（浏览器/APP 默认）。
+- 
+### 1.2 目录结构（关键文件）
+```
+worker/
+  index.js        # Worker 入口：/api/push-test 诊断端点、/voice-turn 路由、WS upgrade → ChatRoom DO
+  chatroom.js     # ChatRoom Durable Object：房间状态、成员、加密握手、消息广播、离线设备注册/触发推送
+  push.js         # 个推/厂商推送核心：鉴权、单推 body 组装、设备注册存取、诊断/清理
+  voiceTurn.js    # /voice-turn：WebRTC TURN 短时凭据（Metered 静态认证，HMAC-SHA1，实例级缓存 1 小时）
+client/
+  js/NodeCrypt.js # WebSocket 客户端 + 加密握手 + logEvent（由 debug 开关控制）
+  js/room.js      # 房间/成员/信令分发（voice-* 消息在此转给 voiceChat）
+  js/chat.js      # 聊天消息渲染；滚动已用 rAF 合批（scheduleScrollToBottom）
+  js/util.voice.js# WebRTC P2P mesh 语音：麦克风采集、信令、远端播放、播放增益
+  js/util.avatar.js # 用户名→头像 SVG 生成（Map 缓存，>300 清空）
+  js/util.i18n.js # 多语言（默认中文）
+  index.html      # 主页面骨架（含 voice-call-panel 通话面板）
+uniapp/
+  App.vue         # APP 生命周期：前台判定、角标（plus.runtime.setBadgeNumber）、push click 路由进房、webview 预热（仅 WiFi、延迟 2.5s）
+  pages/chat/chat.vue       # 聊天页：进入即 close 预加载 webview、请求 RECORD_AUDIO/CAMERA 权限、Android 反射放开 webview 自动播放
+  pages/index/index.vue     # 首页：频道列表 + 未读角标
+  utils/push.js   # uniPush 1.0 监听（click/receive/launch）、cid 注册上报
+  utils/config.js # DEFAULT_ORIGIN（必须 https）、默认频道
+  manifest.json   # 必须保持 "unipush": { "version": "1", "offline": true }（勿改成 2.0）
+```
+
+### 1.3 加密模型（简述）
+- 网页端与 DO 先完成服务端 RSA 握手，再基于房间成员密钥协商出**端到端会话密钥**；服务器只转发密文（`onMessage-server-decrypted` 日志显示的是客户端本地解密后的内容）。
+- 语音信令也复用这条加密通道（`{a:'m', t:'voice-offer/answer/ice/...'}`）。
+- 推送 payload 里**不含消息内容**，只带频道 hash（`sha256(频道名)`），点击后由客户端拉取该频道。
 
 ## 2. 端到端推送链路（核心机制）
 - 服务端**盲中继**：推送只含房间 sha256 hash，绝无房间名/消息明文。
@@ -36,21 +77,69 @@
 -养护：AGC 毕业后维护注意 targetSdkVersion 公告。
 
 ## 4. Secrets/环境变量（wrangler）
-- `GETUI_APP_ID/AppKey/MasterSecret`（个推凭据）
-- `GETUI_ANDROID_PACKAGE`=`uni.app.UNI8357253`
-- `GETUI_HW_CATEGORY`（可选，默认 `IM`；**注意 2026-11-07 实测后台存着 `MARKETING`，需改回 `IM`，否则华为正式通道吃 2 条/日额度**）
-- `GETUI_TEST_MODE`（可选；`1`=所有正式推送走华为测试通道——绕营销额度的临时开关。**实测 OPPO/无厂商通道机在测试模式下也能走个推离线库补投**）
-- `GETUI_MAX_CIDS_PER_CHANNEL`（可选，默认 32）：每频道离线推送设备注册上限。防重装重复靠 30 天 TTL 兜底，上限只是保险丝（2026-11-07 从硬编码 2 上调；此前 3 台手机进同一房间只显示 2 台即因 cap=2）。
+所有凭据保存于 Cloudflare Workers Secrets（后台）——`npx wrangler secret list` 只能看到**名字**、值不可回读。代码一律从 `env.*` 读取（worker/push.js），**仓库内零硬编码凭据**；`wrangler.toml` 不含任何 secret。
 
-### 4.1 推送常见现象备忘
+### 4.0 凭据清单（2026-11-09 线上取证核实）
+| 变量 | 用途 | 当前值 | 备注 |
+|---|---|---|---|
+| `GETUI_APP_ID` | 个推 AppID | `fplnURjNWa53RVsqdEDCZ3` | **不是**华为 AGC AppID `119677959`（那是华为侧的，见 §3 表）。曾误记为 STjyZQ…（2026-11-09 排除） |
+| `GETUI_APP_KEY` | 个推 AppKey | `2Kj0MJuOxn9IMCQFZs1L36` | 与 MasterSecret 配对签名才有效，单独泄漏不可冒用 |
+| `GETUI_MASTER_SECRET` | 个推 MasterSecret | 仅存后台（明文不记录） | **核心签名凭据**，疑似泄漏须在个推后台轮换；只回显 sha256 指纹（见基线） |
+| `GETUI_ANDROID_PACKAGE` | 华为 intent 包名 | `uni.app.UNI8357253` | |
+| `GETUI_APP_NAME` | 通知标题 | `Channel` | 缺省 'NodeCrypt' |
+| `GETUI_HW_CATEGORY` | 华为消息分类 | `IM` | `IM` 正式；排障临时口径见 13.1/13.3 |
+| `GETUI_TEST_MODE` | 华为测试通道开关 | `0` | `1`=排障期临时开（不占营销额度） |
+| `GETUI_MAX_CIDS_PER_CHANNEL` | 每频道离线 cid 上限 | 32（默认） | 保险丝；容量满静默淘汰旧 cid 属预期（push.js） |
+
+**指纹基线与取证方法**（接手人自查口径）：
+- `GET /api/push-test?hash=<hash>&push=1&cid=<cid>` 回显 `fingerprints.{appId,appKey,masterSecret}`＝三个 secret 各自的 **sha256 hex 指纹**（服务端 `sha256Hex()`，从不回显明文）；
+- 2026-11-09 基线：appId=`af582b886c6c271d2bd3dc9ce88436aed9b38735bdf5dc712942313c8891c14a`（＝sha256("fplnURjNWa53RVsqdEDCZ3") ✓）、appKey=`1b3c1d4e41528c3b389ece97076bfaa2db232341f0f4c126a0bbbb4d7feffdad`、masterSecret=`018315f61d17654a90aeb8d4d9c08b3e64d8759f87ee9613335536e52b08a1b6`；
+- 更直接的"正确性"证据：同请求 `auth=ok`（getui 鉴权 sign 成功，需三元组互相匹配；2026-11-09 实测 ✓）。
+
+### 4.1 部署
+```powershell
+# 前置：npx wrangler login（浏览器授权一次）
+npm run build          # 构建 client → dist/
+npm run deploy         # wrangler 部署 worker + 静态资源（本地直署）
+git push origin main   # CI 构建（约 1.5–9 分钟，切换期行为见 13.8）
+```
+- 当前 Worker 名：`nodecrypt`；DO 绑定：ChatRoom；secrets 见 4.0。
+- **部署后 DO 滞留旧代码**：热部署后 DO 内存实例可能继续跑旧版本，先**关闭所有聊天页面（断开 WS）等 10 秒**再测，否则会误判"代码没生效"。
+- 临时调试代码（如回显取证）**只走本地 `npm run deploy`**，不留含调试代码的公开提交；随改随署随 `git checkout` 还原。
+
+### 4.2 本地开发小抄
+1. 前置一次：`npx wrangler login`（浏览器授权）。
+2. 看 secret 名单（值不可回读）：`npx wrangler secret list`。
+3. 设置/轮换某个 secret（交互式输入）：`npx wrangler secret put GETUI_APP_ID`。
+4. 本地跑 worker：`npx wrangler dev`（DO 用本地模拟）；本地 secrets 放 `.dev.vars`（每行 `KEY=value`，**已被 .gitignore 排除、不入库**）。
+5. 本地跑 client：`npm run build`（产物 `dist/`）；`npx wrangler dev` 会带静态资源一起跑。
+6. 本地验证生产代码：`npm run build && npm run deploy`（本地直署上生产）——与 `git push` CI 构建同代码则结果一致。
+
+### 4.3 调试开关（浏览器 console）
+```js
+localStorage.setItem('nodecrypt-debug', '1');   // 开：输出 INFO/EVENT 日志（含解密内容）
+localStorage.removeItem('nodecrypt-debug');     // 关（默认）
+```
+改完刷新页面生效。默认关闭是为了少暴露敏感内容、控制台安静。
+
+### 4.4 推送常见现象备忘
 - **打开 APP 一次性弹出多条旧通知** = 个推离线库历史积压批量补投（服务端零存储，离线期间内容唯一载体就是通知），一次性消化后恢复正常；"有人进房又收到 N 条"时序巧合，服务端没有任何 join 推送路径。
 - **前台静默消失 bug（2026-11-07 修复）**：App.vue 原逻辑"APP 可见就跳过未读计数"，导致手机停在首页时收推送零提示、角标从不出现。修复后：仅当"该消息对应房间正由 webview 前台渲染"（`globalData.activeRoomHash` 比对，chat.vue 桥接上报）才跳过；否则计未读 + 刷新角标 + `plus.push.createMessage` 本地通知（标题 Channel / 有新消息，payload=频道 hash，点击直达房间）。
 
+### 4.5 公开仓库安全性说明
+- **代码公开无碍**：secrets 全部在 Cloudflare/AGC/个推后台；wrangler.toml 无 secret；调试端点常规只回显 sha256 指纹，不回显明文。
+- **凭据冒用面**：个推鉴权 sign=sha256(AppKey+时间戳+MasterSecret)——AppID/AppKey 单独泄漏无冒用风险；MasterSecret 与 AGC Client Secret 是轮换底线。
+- **内容破解面**：消息密钥由房间成员端到端握手派生，服务器只见密文，推送只含频道 sha256——拿到仓库代码 ≠ 解密内容。
+- **现实攻击面**：频道 hash 不可反推名字，但**"频道名+密码"弱组合可被字典试出**（hash 公共、可离线爆破）——正式使用请用强密码/长名字（频道名即随机性补给）。
+- **曾经的取证缺口**：AppID/AppKey 明文无从回读，2026-11-09 用一次性本地直署（临时回显后立即还原）取证完毕，方法存档于 4.2/4.1，指纹见 4.0 基线。
+
 ## 5. 诊断端点
-- `GET /api/push-test`：全频道设备列表
-- `?hash=<hash>`：单频道；`&push=1` 实推一条（返回全过程 raw/body）；`&test=1` 走测试通道
-- `&purge=1`：清设备注册（重装残留 cid）
-- `?report=1&cid=<cid>&taskid=<taskId>`：查个推任务明细/报表（单推 detail 需向个推动态申请权限，可能 `no permission`）
+- `GET /api/push-test` —— 列出所有已注册频道 hash 与设备；
+- `GET /api/push-test?hash=<hash>` —— 单频道设备列表；
+- `GET /api/push-test?hash=<hash>&purge=1` —— 清空该频道（或不带 hash 清全部）设备注册（清残留重装 cid）；
+- `GET /api/push-test?hash=<hash>&push=1` —— **真实下发测试推送**并返回全过程：设备列表、个推鉴权、每个 cid 的 `code/msg/status/delivered/raw/body`、`androidPackage`、`hwCategory`、`vendorBody`；
+- `GET /api/push-test?hash=<hash>&push=1&test=1` —— 同上，但走华为**测试通道**（testMessage，不占正式额度）。
+- `GET /api/push-test?report=1&cid=<cid>&taskid=<taskId>`：查个推任务明细/报表（单推 detail 需向个推动态申请权限，可能 `no permission`）
 - DO 热部署坑：聊天页 WS 不断开时 DO 滞留旧代码——关掉所有聊天页等 10 秒再测。新版判定：不带 push 参数返回 `{channelHash,note}` 简短格式。
 
 ## 6. 客户端（uniapp 壳）注意
@@ -205,6 +294,7 @@
 - WIKO/OPPO 杀掉：靠 getui 离线库补投（打开即收），厂商横幅未生效（OPPO 未接入；WIKO 待查）。
 
 ### 13.7 遗留观察（WIKO 补投正文 JSON）
+> （已被 13.11 收口定案取代，保留判定思路。）
 - WIKO 打开时的补投：receive raw（诊断面板）已是纯文本 `有新消息 [ca978112]`，但通知栏显示的正文仍是 JSON——嫌疑：① 看到的是**通知栏里未清除的旧时代通知**（清通知栏再看最新一条）；② getui 离线补投重组显示。判定法：清空通知栏→杀→发一条→打开→看**置顶最新一条**正文；若仍 JSON，再用诊断 raw 对照（raw 纯文本而通知 JSON=显示层重组，需服务端再适配）。
 
 ### 13.8 部署切换须知（CI 切换期间的行为，实测经验）
@@ -217,7 +307,7 @@
 - 现场实测：真华为杀掉进程收到的通知**带时间戳且人话** ✓（0e110eb 部署验证通过）；
 - WIKO/OPPO 补投期间通知栏出现的 JSON 正文**不带时间戳** → 依判代法初判为**旧时代残留/通知栏滞留**（区分方法：清空通知栏+静置队列 TTL 过期后再看到带新时间戳的人话通知即收官；若清栏后新通知仍 JSON 无时间戳，再走显示层重组对策：透传 payload 仅发 hash8 短串、厂商通知文案与点击 payload 彻底解耦）。
 
-### 13.10 透传 payload 短串化（6aa2b9a，收口对策）
+### 13.10 透传 payload 短串化（6aa2b9a——**已撤回**，13.11 终态改回统一人话；保留经验）
 - 实证链：receive raw（诊断面板）已是带时间戳人话（`有新消息 [ca978112] 19:16`+），但**非厂商机型通知栏的正文仍显示长 JSON（payload 被截断省略）** → 显示层在重组 payload（个推/DCloud 离线转通知的具体重组机理未开源，无从拦截）。
 - 对策：`push_message.transmission` 由人话长文案改为**极短标签** `[hash8] HH:MM`（notifyTag()）；厂商通知 title/body 仍走 notifyBody 人话（华为横幅不受影响）。显示层无论怎么重组，可见内容只剩一行短标签，可读且不误导。
 - 客户端无需再改：extractHash 的整串 `[hash8]` TAG 扫描直接匹配 `[ca978112] 19:58` 形态，角标/路由链保持。
