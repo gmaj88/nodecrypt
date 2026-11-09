@@ -402,11 +402,45 @@ export function preventSpaceInput(input) {
 	})
 }
 
+// 随机生成隐藏密码（≤15 字符、无空白；用户不可见不可输，凭分享链接共享）
+// Generate a hidden random password (<=15 chars, no whitespace; never shown to users,
+// shared only via the share link)
+function generateHiddenPassword() {
+	const pwd = `${Date.now().toString(36)}${Math.random().toString(36).slice(2, 8)}`;
+	return pwd.toLowerCase().replace(/[^a-z0-9]/g, '').slice(0, 15);
+}
+
+// 新建频道成功后的分享提示浮层（链接=凭据，弱混淆不可当加密件公开发布）
+// Share prompt modal right after a Node is created (the link IS the credential —
+// only obfuscated, do not post it publicly)
+function showSharePrompt() {
+	const rd = roomsData[activeRoomIndex];
+	if (!rd || !rd.roomName) return;
+	const encryptedRoom = simpleEncrypt(rd.roomName.trim());
+	let url = `${location.origin}${location.pathname}?r=${encodeURIComponent(encryptedRoom)}`;
+	if (rd.password) {
+		url += `&p=${encodeURIComponent(simpleEncrypt(rd.password))}`;
+	}
+	const box = document.createElement('div');
+	box.className = 'login-modal';
+	box.innerHTML = `<div class="login-modal-bg"></div><div class="login-modal-card"><button class="login-modal-close login-modal-close-abs">&times;</button><h1>${t('action.share_prompt_title', 'Node created')}</h1><p style="font-size:13px;color:#666;margin:8px 0;">${t('action.share_prompt_desc', 'Copy the share link below and send it to your friends. Opening the link joins the same Node (the password is never shown).')}</p><textarea id="share-link-box" readonly style="width:100%;height:64px;font-size:12px;"></textarea><button type="button" class="login-btn" id="share-link-copy">${t('action.copy_link', 'Copy link')}</button></div>`;
+	document.body.appendChild(box);
+	box.querySelector('#share-link-box').value = url;
+	box.querySelector('.login-modal-close').onclick = () => box.remove();
+	box.querySelector('#share-link-copy').onclick = () => copyToClipboard(url, t('action.share_copied', 'Share link copied!'), t('action.copy_url_failed', 'Copy failed, url:'));
+}
+
 // Login form submit handler
 // 登录表单提交处理函数
 export function loginFormHandler(modal) {
 	return function(e) {
 		e.preventDefault();
+		// fromLink：本表单由分享链接自动填充（autofillRoomPwd 打旗标）→ 不生成新密码；
+		// 否则密码为空即为“创建新的频道”：自动生成隐藏密码，成功后弹分享提示。
+		// fromLink: this form was autofilled from a share link (flag set by autofillRoomPwd)
+		// → keep the link credential as-is; otherwise an empty password means "create a
+		// new Node": generate a hidden one and show the share prompt once joined.
+		const fromLink = !!(e.target && e.target.dataset && e.target.dataset.fromLink === '1');
 		let userName, roomName, password, btn, roomInput, warnTip;
 		if (modal) {
 			userName = document.getElementById('userName-modal').value.trim();
@@ -447,14 +481,23 @@ export function loginFormHandler(modal) {
 				btn.innerText = t('ui.enter', 'ENTER')
 			}
 			return
-		}		if (btn) {
+		}		let wasCreated = false;
+		if (!password && !fromLink) {
+			password = generateHiddenPassword();
+			const pwdInput = document.getElementById(modal ? 'password-modal' : 'password');
+			if (pwdInput) pwdInput.value = password;
+			wasCreated = true;
+		}
+		if (btn) {
 			btn.disabled = true;
 			btn.innerText = t('ui.connecting', 'Connecting...')
 		}
 		window.joinRoom(userName, roomName, password, modal, function(success) {
 			if (!success && btn) {
 				btn.disabled = false;
-				btn.innerText = 'ENTER'
+				btn.innerText = t('ui.enter', 'ENTER')
+			} else if (success && wasCreated) {
+				showSharePrompt()
 			}
 		})
 	}
@@ -462,6 +505,12 @@ export function loginFormHandler(modal) {
 
 // 生成登录表单HTML
 // Generate login form HTML
+// 密码输入框隐藏保留（display:none + 去掉 minlength，避免浏览器校验不可聚焦报错）：
+// 分享链接进入时仍需向 #password 自动填入凭据，用户不可见不可输；
+// 创建频道时密码由 generateHiddenPassword 自动生成。
+// The password input stays in the DOM but hidden (display:none, minlength removed to avoid
+// "not focusable" validation errors on hidden controls): share links still autofill it,
+// users can neither see nor type it; on create the password is generated automatically.
 export function generateLoginForm(isModal = false) {
 	const idPrefix = isModal ? '-modal' : '';
 	return `		<div class="input-group">
@@ -472,8 +521,9 @@ export function generateLoginForm(isModal = false) {
 			<input id="roomName${idPrefix}" type="text" required minlength="1" maxlength="15" placeholder="">
 			<label for="roomName${idPrefix}" class="floating-label">${t('ui.node_name', 'Node Name')}</label>
 		</div>
-		<div class="input-group">
-			<input id="password${idPrefix}" type="password" autocomplete="${isModal ? 'off' : 'current-password'}" minlength="1" maxlength="15" placeholder="">
+		<div style="font-size:12px;color:#8a8f98;margin:-8px 0 10px;text-align:left;">${t('ui.password_auto_hint', 'Password is generated automatically — join by sharing the link')}</div>
+		<div class="input-group" style="display:none;">
+			<input id="password${idPrefix}" type="password" autocomplete="off" maxlength="15" placeholder="">
 			<label for="password${idPrefix}" class="floating-label">${t('ui.node_password', 'Node Password')} <span class="optional">${t('ui.optional', '(optional)')}</span></label>
 		</div>
 		<button type="submit" class="login-btn">${t('ui.enter', 'ENTER')}</button>
@@ -564,6 +614,13 @@ export function autofillRoomPwd(formPrefix = '') {
 				pwdInput.style.color = 'transparent';
 			}
 		}
+		// 标记本表单来自分享链接（autofill）：提交时按链接凭据原样加入，
+		// 不再生成新的隐藏密码（否则旧“无密码链接”会被误当新频道创建）
+		// Mark this form as autofilled from a share link: join with the link credential
+		// as-is and never regenerate a password (otherwise legacy no-password links
+		// would be treated as creating a brand-new Node)
+		const fromLinkForm = document.getElementById(`login-form${formPrefix ? '-modal' : ''}`);
+		if (fromLinkForm) fromLinkForm.dataset.fromLink = '1';
 	}
 	// 未自动填充时也可从 URL 读取用户名（autojoin 模式）
 	// Read username from URL even without auto-fill (autojoin mode)
