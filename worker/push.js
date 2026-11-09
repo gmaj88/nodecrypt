@@ -188,17 +188,17 @@ const NOTIFY_BODY = '有新消息';
 // （截断 hash 无明文，碰撞概率对个位数频道可忽略），保持盲中继设计。
 // Routing fallback tag: the Getui-store redelivery path rebuilds the click payload
 // as title/content and drops our custom payload (observed on-device), so embed the
-// first 8 hex chars of the room hash into the body as [xxxxxxxx]; the client
+// first 12 hex chars of the room hash into the body as [xxxxxxxxxxxx]; the client
 // prefix-matches it against registered channels. The server still never learns the
-// room name (truncated hash, collision negligible for single-digit channel counts),
-// preserving the blind-relay design.
+// room name (truncated hash; 48-bit prefix keeps collision probability ~1e-9 for
+// thousands of channels), preserving the blind-relay design.
 function notifyBody(channelHash) {
-	// 正文尾缀加发送时刻 HH:MM：手机上可一眼区分“本轮新消息”与“离线队列/通知栏残留”
-	// （残留 payload 没有时间戳或时间已过），判代不再依赖猜测。
-	// Append the dispatch time HH:MM so any notification self-identifies whether it is
-	// a fresh message or a stale queue/tray leftover — no more guessing epochs.
-	const stamp = new Date(Date.now() + 8 * 3600 * 1000).toISOString().slice(11, 16);
-	return `${NOTIFY_BODY} [${String(channelHash || '').slice(0, 8)}] ${stamp}`;
+	// 正文尾缀加发送时刻"YYYY-MM-DD HH:MM"（+8 时区）：手机上可一眼区分“本轮新消息”
+	// 与“离线队列/通知栏残留”（残留 payload 没有当日时间戳或时间已过），判代不靠猜。
+	// Append the dispatch time "YYYY-MM-DD HH:MM" (+8) so any notification
+	// self-identifies whether it is a fresh message or a stale queue/tray leftover.
+	const stamp = new Date(Date.now() + 8 * 3600 * 1000).toISOString().slice(0, 16).replace('T', ' ');
+	return `${NOTIFY_BODY} [${String(channelHash || '').slice(0, 12)}] ${stamp}`;
 }
 // 环境变量 GETUI_ANDROID_PACKAGE 必须与云打包设置的 Android 包名一致（intent 依赖它）
 // Env GETUI_ANDROID_PACKAGE must equal the Android package name set in cloud packaging
@@ -247,10 +247,9 @@ function buildPushBody(env, channelHash, audienceCid, testMessage) {
 		// notification itself — fixes the black hole where an online "notification"
 		// message was counted delivered while the app process was dead/foreground.
 		// Killed phones: vendor offline notification banner, or offline-store redelivery.
-		// 透传 payload 统一为人话（有新消息 [hash8] HH:MM）——用户定稿格式；厂商通知
-		// title/body 同源（notifyBody），所有链路正文口径一致。WIKO/OPPO 通知栏残留的
-		// 长 JSON 已证实为时代快照回放（13.10），与本 payload 无关。
-		// Transmission payload = the canonical human text (NOTIFY_BODY [hash8] HH:MM);
+		// 透传 payload 统一为人话（有新消息 [hash12] YYYY-MM-DD HH:MM）——用户定稿格式；
+		// 厂商通知 title/body 同源（notifyBody），所有链路正文口径一致。
+		// Transmission payload = the canonical human text (NOTIFY_BODY [hash12] date time);
 		// vendor notification shares notifyBody so every path speaks the same prose.
 		push_message: {
 			transmission: notifyBody(payloadText)
