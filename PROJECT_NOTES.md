@@ -82,7 +82,7 @@ uniapp/
 ### 4.0 凭据清单（2026-11-09 线上取证核实）
 | 变量 | 用途 | 当前值 | 备注 |
 |---|---|---|---|
-| `GETUI_APP_ID` | 个推 AppID | `fplnURjNWa53RVsqdEDCZ3` | **不是**华为 AGC AppID `119677959`（那是华为侧的，见 §3 表）。曾误记为 STjyZQ…（2026-11-09 排除） |
+| `GETUI_APP_ID` | 个推 AppID | `fplnURjNWa53RVsqdEDCZ3` | [获取地址](https://dev.dcloud.net.cn/pages/app/push/index) |
 | `GETUI_APP_KEY` | 个推 AppKey | `2Kj0MJuOxn9IMCQFZs1L36` | 与 MasterSecret 配对签名才有效，单独泄漏不可冒用 |
 | `GETUI_MASTER_SECRET` | 个推 MasterSecret | 仅存后台（明文不记录） | **核心签名凭据**，疑似泄漏须在个推后台轮换；只回显 sha256 指纹（见基线） |
 | `GETUI_ANDROID_PACKAGE` | 华为 intent 包名 | `uni.app.UNI8357253` | |
@@ -123,6 +123,7 @@ localStorage.removeItem('nodecrypt-debug');     // 关（默认）
 改完刷新页面生效。默认关闭是为了少暴露敏感内容、控制台安静。
 
 ### 4.4 推送常见现象备忘
+- **通知栏正文显示 JSON（{"title","content","payload"} 长串）**：历史根因是客户端本地通知参数错误（见 13.12，2026-11-09 已修复）；判别法——**推送诊断 raw（首页长按频道）是人话而通知是 JSON**→ 查客户端本机通知代码；两者都是 JSON→ 查服务端透传 payload 形态（13.2 对照表）。
 - **打开 APP 一次性弹出多条旧通知** = 个推离线库历史积压批量补投（服务端零存储，离线期间内容唯一载体就是通知），一次性消化后恢复正常；"有人进房又收到 N 条"时序巧合，服务端没有任何 join 推送路径。
 - **前台静默消失 bug（2026-11-07 修复）**：App.vue 原逻辑"APP 可见就跳过未读计数"，导致手机停在首页时收推送零提示、角标从不出现。修复后：仅当"该消息对应房间正由 webview 前台渲染"（`globalData.activeRoomHash` 比对，chat.vue 桥接上报）才跳过；否则计未读 + 刷新角标 + `plus.push.createMessage` 本地通知（标题 Channel / 有新消息，payload=频道 hash，点击直达房间）。
 
@@ -294,7 +295,7 @@ localStorage.removeItem('nodecrypt-debug');     // 关（默认）
 - WIKO/OPPO 杀掉：靠 getui 离线库补投（打开即收），厂商横幅未生效（OPPO 未接入；WIKO 待查）。
 
 ### 13.7 遗留观察（WIKO 补投正文 JSON）
-> （已被 13.11 收口定案取代，保留判定思路。）
+> （**结论被 13.12 推翻**：JSON 通知是客户端本机通知参数 bug 现造，不是旧通知滞留/重组。仅判定思路留档。）
 - WIKO 打开时的补投：receive raw（诊断面板）已是纯文本 `有新消息 [ca978112]`，但通知栏显示的正文仍是 JSON——嫌疑：① 看到的是**通知栏里未清除的旧时代通知**（清通知栏再看最新一条）；② getui 离线补投重组显示。判定法：清空通知栏→杀→发一条→打开→看**置顶最新一条**正文；若仍 JSON，再用诊断 raw 对照（raw 纯文本而通知 JSON=显示层重组，需服务端再适配）。
 
 ### 13.8 部署切换须知（CI 切换期间的行为，实测经验）
@@ -307,7 +308,7 @@ localStorage.removeItem('nodecrypt-debug');     // 关（默认）
 - 现场实测：真华为杀掉进程收到的通知**带时间戳且人话** ✓（0e110eb 部署验证通过）；
 - WIKO/OPPO 补投期间通知栏出现的 JSON 正文**不带时间戳** → 依判代法初判为**旧时代残留/通知栏滞留**（区分方法：清空通知栏+静置队列 TTL 过期后再看到带新时间戳的人话通知即收官；若清栏后新通知仍 JSON 无时间戳，再走显示层重组对策：透传 payload 仅发 hash8 短串、厂商通知文案与点击 payload 彻底解耦）。
 
-### 13.10 透传 payload 短串化（6aa2b9a——**已撤回**，13.11 终态改回统一人话；保留经验）
+### 13.10 透传 payload 短串化（6aa2b9a——**已撤回，且其"显示层重组"动机被 13.12 推翻**）
 - 实证链：receive raw（诊断面板）已是带时间戳人话（`有新消息 [ca978112] 19:16`+），但**非厂商机型通知栏的正文仍显示长 JSON（payload 被截断省略）** → 显示层在重组 payload（个推/DCloud 离线转通知的具体重组机理未开源，无从拦截）。
 - 对策：`push_message.transmission` 由人话长文案改为**极短标签** `[hash8] HH:MM`（notifyTag()）；厂商通知 title/body 仍走 notifyBody 人话（华为横幅不受影响）。显示层无论怎么重组，可见内容只剩一行短标签，可读且不误导。
 - 客户端无需再改：extractHash 的整串 `[hash8]` TAG 扫描直接匹配 `[ca978112] 19:58` 形态，角标/路由链保持。
@@ -315,7 +316,15 @@ localStorage.removeItem('nodecrypt-debug');     // 关（默认）
 - 判代法补充：通知正文**带新 HH:MM**=本轮新消息；**不带/时间已过**=残留（getui 离线库 TTL=1h 自然过期）。
 
 ### 13.11 收口实验与终态（20:2x，6aa2b9a 后回滚为统一人话格式）
+> （**"个推离线库/SDK 缓存快照回放"假说已被 13.12 推翻**：用户重装 APP 后 JSON 仍复现，回放解释不成立——那个 JSON 每次都是客户端现造的。仅实验结论留档：A 无自循环 ✓ 仍有效；"终态统一人话"与服务端决策正确不变。）
 - **实验 A（清空通知栏+静止 5 分钟）**：无任何自发消息 → 排除"自循环生成"。
 - **实验 B（强行停止+重开）**：打开即收到补投，通知栏正文仍为长 JSON（`{"title":"Channel","content":"有新消息","payload":"ca978…"}`，**无时间戳**），而同期 receive raw（诊断面板）均为带时间戳人话 → 实锤：**通知栏 JSON 与当前消息 payload 无关，是个推离线库/SDK 缓存中"三字段时代快照"的回放**（强杀无法清除，疑 GTSDK 侧通知缓存或离线库未 ACK 重投；彻底清除需卸载重装/清除应用数据，代价是本地频道列表与 cid 重注册）。
 - **终态服务端格式（用户定稿）**：所有下发链路正文统一人话 `有新消息 [hash8] HH:MM`（transmission 与厂商通知同源 notifyBody；短串化 notifyTag 试验撤回）。
 - 当前残留下一步（明日复测项）：① 新消息各端通知正文应为带时间戳人话；② 若 WIKO/OPPO 通知栏 JSON 残留仍在且影响观感，动"卸载重装/清除数据"清缓存（重加频道 a 即可回环）；③ 厂商点击角标链路（13.5）与前台角标（13.6）维持已通状态。
+
+### 13.12 真根因：plus.push.createMessage 参数签名错误（2026-11-09 定案，13.7/13.10/13.11 假说全部推翻）
+- **现象收敛**：通知栏 JSON 正文（`{"title":"Channel","content":"有新消息","payload":"ca978…"}`）在 Huawei/WIKO/OPPO 都出现过、重装 APP 仍复现、receive raw（诊断面板）是人话——三条矛盾长期误导排查。
+- **根因**：App.vue notifyLocalPush 把 `plus.push.createMessage(content, payload, options)` 三参全传错——① **整对象当第 1 参（content）**→ 原生桥接把对象 JSON 序列化 → 通知正文=对象 JSON 串；② 第 2 参传 `{}` → 点击消息 payload 丢失，点击路由不稳；③ 第 3 参传**回调函数**（应传 options）→ `cover/notifyId/autoCancel` 全部静默失效 → 通知堆叠不覆盖、震动回调从未执行。
+- **为何与机型无关**：这段本机通知代码在"APP 存活收到消息"时一律执行（前台首页计数路径 + 打开补投路径），与服务端 payload、个推离线库、厂商通道全部无关；厂商横幅（华为）抢占了注意力，导致 WIKO/OPPO（无横幅）暴露了 JSON。正文无时间戳、payload 是完整 64 位 hash，都来自客户端硬编码与服务端透传 payload 是两回事。
+- **修复（App.vue）**：`notifyLocalPush(target, msg)` 按签名三参传值——content=推送原始正文（服务端人话+时间戳，异常形态兜底'有新消息'）、payload=频道完整 hash（click 事件 extractHash 直接命中，点击直达修复）、options={title:'Channel',cover:true,autoCancel:true}；震动改为调用后直接 `uni.vibrateLong()`（此前从未生效）。
+- **排查教训**：诊断面板 raw 与通知栏正文是**两条不同来源**（透传 vs 本机通知），比对时必须分别取值；"某种数据结构反复出现"先查**本进程代码现造**的可能，再查外部缓存/服务端——"重装仍复现"本应立刻排除一切本地缓存假说（本可以更早破案，D 测试后重装提醒了这一点）。
