@@ -26,7 +26,14 @@ class NodeCrypt {
 			rsaPublic: config.rsaPublic || '',
 			wsAddress: config.wsAddress || '',
 			reconnectDelay: config.reconnectDelay || 3000,
-			pingInterval: config.pingInterval || 20000,
+			// 心跳 10s + pong 看门狗 25s：半开/静默断链最多 ~25s 即被检测并强制重连
+			// （修复"手机新进房约 1 分钟才互相可见"：此前 pong 被忽略，只能等 OS TCP 超时）
+			// Heartbeat 10s + pong watchdog 25s: half-open/silently broken sockets are detected
+			// within ~25s and force-reconnected (previously pong was ignored and recovery
+			// waited for the OS TCP timeout, ~1 minute)
+			pingInterval: config.pingInterval || 10000,
+			pongTimeout: config.pongTimeout || 25000,
+			pendingHandshakeTimeout: config.pendingHandshakeTimeout || 8000,
 			debug: config.debug || false,
 		};
 		this.callbacks = {
@@ -35,6 +42,7 @@ class NodeCrypt {
 			onClientSecured: callbacks.onClientSecured || null,
 			onClientList: callbacks.onClientList || null,
 			onClientMessage: callbacks.onClientMessage || null,
+			onClientPending: callbacks.onClientPending || null,
 		};
 		this.SERVER_KEY_STORAGE = 'nodecrypt_server_key';
 		try {
@@ -49,6 +57,15 @@ class NodeCrypt {
 		this.reconnect = null;
 		this.ping = null;
 		this.channel = {};
+		// 传输时间线与看门狗状态（debug 日志 + 重连判定）
+		// Transport timeline & watchdog state (debug logs + reconnect decisions)
+		this.lastPongAt = 0;
+		this.lastPingSentAt = 0;
+		this.probeTimer = null;
+		this.connectStartedAt = 0;
+		// 每个尚未完成握手的 peer 的延时检查器（8s 后仍未 secured → onClientPending）
+		// Deferred checkers for peers that never finish the handshake (8s → onClientPending)
+		this.pendingPeerTimers = {};
 		this.setCredentials = this.setCredentials.bind(this);
 		this.connect = this.connect.bind(this);
 		this.destruct = this.destruct.bind(this);
@@ -66,6 +83,7 @@ class NodeCrypt {
 		this.disconnect = this.disconnect.bind(this);
 		this.sendMessage = this.sendMessage.bind(this);
 		this.sendChannelMessage = this.sendChannelMessage.bind(this);
+		this.armLifecycleWatchdog = this.armLifecycleWatchdog.bind(this);
 		this.encryptServerMessage = this.encryptServerMessage.bind(this);
 		this.decryptServerMessage = this.decryptServerMessage.bind(this);
 		this.encryptClientMessage = this.encryptClientMessage.bind(this);
@@ -77,6 +95,9 @@ class NodeCrypt {
 		// Per-session registration state and late-cid retry timer (cid may arrive after page load)
 		this.pushTokenRegistered = null;
 		this.pushTokenRetryTimer = null;
+		// 前台恢复/网络切换时的连通性看门狗（只在浏览器环境生效）
+		// Connectivity watchdog on resume/network events (browser environments only)
+		this.armLifecycleWatchdog();
 	}
 
 	// 注册离线推送设备：cid 已知且加密通道就绪时上送，幂等；返回是否执行了一次注册
@@ -163,6 +184,9 @@ class NodeCrypt {
 		this.serverKeys = null;
 		this.serverShared = null;
 		this.channel = {};
+		this.clearPendingPeerTimers();
+		this.connectStartedAt = Date.now();
+		this.lastPongAt = 0;
 		try {
 			this.connection = new WebSocket(this.config.wsAddress);
 			this.connection.onopen = this.onOpen;
@@ -182,13 +206,16 @@ class NodeCrypt {
 		this.logEvent('destruct');
 		this.stopReconnect();
 		this.stopPing();
+		this.clearPendingPeerTimers();
 		this.reconnect = null;
 		this.ping = null;
 		this.config = {
 			rsaPublic: '',
 			wsAddress: '',
 			reconnectDelay: 3000,
-			pingInterval: 15000,
+			pingInterval: 10000,
+			pongTimeout: 25000,
+			pendingHandshakeTimeout: 8000,
 			debug: false,
 		};
 		this.callbacks.onServerClosed = null;
@@ -222,7 +249,8 @@ class NodeCrypt {
 	// WebSocket open event handler
 	// WebSocket 连接打开事件处理
 	async onOpen() {
-		this.logEvent('onOpen');
+		this.logEvent('onOpen', this.connectStartedAt ? ('connect→open ' + (Date.now() - this.connectStartedAt) + 'ms') : '');
+		this.lastPongAt = Date.now();
 		this.startPing();
 		try {
 			this.serverKeys = await crypto.subtle.generateKey({
@@ -243,6 +271,14 @@ class NodeCrypt {
 			return
 		}
 		if (event.data === 'pong') {
+			// pong 是唯一可信的连通证据：更新看门狗时间戳（此前被直接忽略，
+			// 半开连接要等 OS TCP 超时 ~1 分钟才被发现）
+			// pong is the only trustworthy liveness proof: refresh the watchdog timestamp
+			// (previously it was ignored, so half-open sockets were only detected after
+			// the OS TCP timeout, ~1 minute)
+			const rtt = this.lastPingSentAt ? (Date.now() - this.lastPingSentAt) : null;
+			this.lastPongAt = Date.now();
+			this.logEvent('pong', rtt !== null ? (rtt + 'ms') : '');
 			return
 		}
 		this.logEvent('onMessage', event.data);
@@ -303,31 +339,51 @@ class NodeCrypt {
 			return
 		}
 		if (serverDecrypted.a === 'l' && this.isArray(serverDecrypted.p)) {
+			let logListResend = 0;
 			try {
 				for (const clientId in this.channel) {
 					if (serverDecrypted.p.indexOf(clientId) < 0) {
+						if (this.pendingPeerTimers[clientId]) {
+							clearTimeout(this.pendingPeerTimers[clientId]);
+							delete this.pendingPeerTimers[clientId]
+						}
 						delete(this.channel[clientId])
 					}
 				}
 				let payloads = {};
 				for (const clientId of serverDecrypted.p) {
-					if (!this.channel[clientId]) {
+					const entry = this.channel[clientId];
+					if (!entry) {
 						this.channel[clientId] = {
 							username: null,
 							keys: this.clientEc.genKeyPair(),
 							shared: null,
 						};
 						payloads[clientId] = this.channel[clientId].keys.getPublic('hex')
+					} else if (!entry.shared || !entry.username) {
+						// 之前条目存在但握手未完成（断链丢包/被冻结）：复用旧密钥对重发公钥，
+						// 让服务端的成员表重播能真正触发重新握手；否则只能整条重连才能恢复。
+						// Entry exists but the handshake never completed (dropped messages /
+						// suspended page): resend the same public key so server member-list
+						// rebroadcasts actually retrigger negotiation.
+						logListResend += 1;
+						payloads[clientId] = entry.keys.getPublic('hex')
+					}
+					if (entry && !entry.username) {
+						this.armPendingPeerCheck(clientId)
 					}
 				}
 				if (Object.keys(payloads).length > 0) {
 					// n:0 = 控制类封装：服务器只转发，不触发离线设备推送（防幽灵通知）
 					// n:0 = control wrapper: server relays only, no offline-device push
+					this.logEvent('onMessage-list', 'peers=' + serverDecrypted.p.length + ' resend=' + logListResend);
 					this.sendMessage(this.encryptServerMessage({
 						a: 'w',
 						n: 0,
 						p: payloads,
 					}, this.serverShared))
+				} else {
+					this.logEvent('onMessage-list', 'peers=' + serverDecrypted.p.length + ' resend=0')
 				}
 			} catch (error) {
 				this.logEvent('onMessage-list', error, 'error')
@@ -386,6 +442,28 @@ class NodeCrypt {
 			return
 		}
 		if (serverDecrypted.a === 'c' && this.channel[serverDecrypted.c] && this.channel[serverDecrypted.c].shared) {
+			// 对方重发公钥（64hex 明文，与密文 "iv|counter|ct" 格式可区分）：说明对方的
+			// 重握手在等我们的 u——复用既有 shared 补发 u，双方凭服务端成员表重播完成自愈
+			// The peer re-sent its pubkey (64-hex, distinguishable from "iv|counter|ct"
+			// ciphertext): their renegotiation is waiting for our u — reply using the
+			// already-established shared key so both sides heal via server rebroadcasts
+			const resendEntry = this.channel[serverDecrypted.c];
+			if (this.isString(serverDecrypted.p) && /^[0-9a-f]{64}$/.test(serverDecrypted.p)) {
+				try {
+					this.sendMessage(this.encryptServerMessage({
+						a: 'c',
+						n: 0,
+						p: this.encryptClientMessage({
+							a: 'u',
+							p: this.credentials.username
+						}, resendEntry.shared),
+						c: serverDecrypted.c
+					}, this.serverShared))
+				} catch (error) {
+					this.logEvent('onMessage-client', error, 'error')
+				}
+				return
+			}
 			const clientDecrypted = this.decryptClientMessage(serverDecrypted.p, this.channel[serverDecrypted.c].shared);
 			this.logEvent('onMessage-client-decrypted', clientDecrypted);
 			if (!this.isObject(clientDecrypted) || !this.isString(clientDecrypted.a)) {
@@ -393,6 +471,12 @@ class NodeCrypt {
 			}
 			if (clientDecrypted.a === 'u' && this.isString(clientDecrypted.p) && clientDecrypted.p.match(/\S+/) && !this.channel[serverDecrypted.c].username) {
 				this.channel[serverDecrypted.c].username = clientDecrypted.p.replace(/^\s+/, '').replace(/\s+$/, '');
+				// 该 peer 已完成握手：撤销 8s 未握手提示检查
+				// Peer secured: cancel the 8s pending-handshake check
+				if (this.pendingPeerTimers[serverDecrypted.c]) {
+					clearTimeout(this.pendingPeerTimers[serverDecrypted.c]);
+					delete this.pendingPeerTimers[serverDecrypted.c]
+				}
 				if (this.callbacks.onClientSecured) {
 					try {
 						this.callbacks.onClientSecured({
@@ -502,14 +586,137 @@ class NodeCrypt {
 		}
 	}
 
-	// Start ping timer
-	// 启动心跳定时器
+	// Start ping timer (10s 心跳 + 25s pong 看门狗)
+	// 心跳只发不判时，半开连接要等 OS TCP 超时才能恢复（实测 ~1 分钟）。
+	// Start ping timer (10s heartbeat + 25s pong watchdog; a half-open socket would
+	// otherwise only be detected via the OS TCP timeout, ~1 minute)
 	startPing() {
 		this.stopPing();
 		this.logEvent('startPing');
 		this.ping = setInterval(() => {
+			if (!this.isOpen()) {
+				return
+			}
+			const now = Date.now();
+			if (this.lastPongAt && now - this.lastPongAt > this.config.pongTimeout) {
+				this.logEvent('ping-watchdog', 'no pong for ' + (now - this.lastPongAt) + 'ms, forcing reconnect', 'warn');
+				this.forceReconnect('ping-watchdog');
+				return
+			}
+			this.lastPingSentAt = now;
 			this.sendMessage('ping')
 		}, this.config.pingInterval)
+	}
+
+	// 主动断开以触发既有 onclose→3s 重连路径；close 失败时回退到 disconnect
+	// Force-close to trigger the existing onclose→3s reconnect path; fall back to disconnect
+	forceReconnect(why) {
+		this.logEvent('forceReconnect', why, 'warn');
+		try {
+			this.connection.close()
+		} catch (error) {
+			this.logEvent('forceReconnect', error, 'error');
+			this.disconnect();
+			if (this.credentials) {
+				this.startReconnect()
+			}
+		}
+	}
+
+	// 前台恢复/网络恢复时的连通性检查：socket 不通立即重连；连通但长时间无 pong
+	// 先发一次探测 ping，3s 内无回包则强制重连（失败连接借用了挂起的 TCP 缓冲/被
+	// 冻结的 webview 都会在这一步被识别）。
+	// Connectivity check on visibility/online/focus: reconnect immediately if the socket
+	// isn't open; otherwise probe with a ping and force-reconnect if no pong within 3s
+	armLifecycleWatchdog() {
+		if (typeof window === 'undefined' || typeof document === 'undefined' || this.lifecycleArmed) {
+			return
+		}
+		this.lifecycleArmed = true;
+		const refresh = (why) => {
+			if (!this.credentials) {
+				return
+			}
+			this.logEvent('lifecycle', why);
+			if (!this.connection) {
+				this.connect();
+				return
+			}
+			const state = this.connection.readyState;
+			if (state === WebSocket.CONNECTING) {
+				// 正在握手的连接不该被中断（避免 while-connecting 双重 connect 导致重连风暴）
+				// Don't interrupt a connecting socket (avoids double-connect churn)
+				this.logEvent('lifecycle', why + ': connecting, keep waiting');
+				return
+			}
+			if (state !== WebSocket.OPEN) {
+				this.logEvent('lifecycle', why + ': socket not open, reconnecting now');
+				this.stopReconnect();
+				this.connect();
+				return
+			}
+			const now = Date.now();
+			if (this.lastPongAt && now - this.lastPongAt > this.config.pongTimeout) {
+				this.forceReconnect(why + ': stale (no pong ' + (now - this.lastPongAt) + 'ms)');
+				return
+			}
+			if (now - (this.lastPongAt || 0) > this.config.pingInterval) {
+				this.lastPingSentAt = now;
+				this.sendMessage('ping');
+				if (this.probeTimer) {
+					clearTimeout(this.probeTimer)
+				}
+				this.probeTimer = setTimeout(() => {
+					this.probeTimer = null;
+					const stale = this.lastPongAt && (Date.now() - this.lastPongAt) > this.config.pongTimeout;
+					if (this.credentials && stale && this.isOpen()) {
+						this.forceReconnect('lifecycle-probe')
+					}
+				}, 3000)
+			}
+		};
+		document.addEventListener('visibilitychange', () => {
+			if (document.visibilityState === 'visible') {
+				refresh('visibility-change')
+			}
+		});
+		window.addEventListener('focus', () => refresh('focus'));
+		window.addEventListener('online', () => refresh('online'));
+	}
+
+	// 清理所有未握手 peer 的延时检查器
+	// Clear deferred checkers for pending peer handshakes
+	clearPendingPeerTimers() {
+		for (const peerId in this.pendingPeerTimers) {
+			clearTimeout(this.pendingPeerTimers[peerId])
+		}
+		this.pendingPeerTimers = {}
+	}
+
+	// 某 peer 的 username 尚未到达时挂一个 8s 检查：到点仍未 secured → onClientPending。
+	// 这把"密码不一致/链路丢包导致的静默隐身"变成可见的系统提示。
+	// Schedule an 8s check when a peer has no username yet; if still unsecured →
+	// onClientPending. Turns silent invisibility (password mismatch / lost handshake)
+	// into a visible system notice.
+	armPendingPeerCheck(peerId) {
+		if (this.pendingPeerTimers[peerId]) {
+			return
+		}
+		this.pendingPeerTimers[peerId] = setTimeout(() => {
+			delete this.pendingPeerTimers[peerId];
+			const entry = this.channel[peerId];
+			if (!entry || entry.username) {
+				return
+			}
+			this.logEvent('pending-handshake', peerId, 'warn');
+			if (this.callbacks.onClientPending) {
+				try {
+					this.callbacks.onClientPending({ clientId: peerId })
+				} catch (error) {
+					this.logEvent('onClientPending-callback', error, 'error')
+				}
+			}
+		}, this.config.pendingHandshakeTimeout)
 	}
 
 	// Stop ping timer
@@ -520,6 +727,11 @@ class NodeCrypt {
 			clearInterval(this.ping);
 			this.ping = null
 		}
+		if (this.probeTimer) {
+			clearTimeout(this.probeTimer);
+			this.probeTimer = null
+		}
+		this.lastPingSentAt = 0
 	}
 
 	// Disconnect from server

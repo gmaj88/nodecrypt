@@ -56,6 +56,24 @@ function simpleDecrypt(encrypted) {
 	}
 }
 
+// 密码指纹（FNV-1a 32bit，8 位 hex）：同一频道在不同设备上显示相同指纹，
+// 便于肉眼判断"同名房间是否真的同一房间"（手动新建会生成不同随机密码）。
+// Password fingerprint (FNV-1a 32bit, 8-hex): the same Node shows the same
+// fingerprint on every device, so users can tell apart same-name rooms that were
+// created independently (each gets its own hidden random password).
+function passwordFingerprint(password) {
+	if (!password) return '';
+	let hash = 0x811c9dc5;
+	const source = typeof TextEncoder !== 'undefined'
+		? new TextEncoder().encode(String(password))
+		: (() => { const s = String(password); const a = new Uint8Array(s.length); for (let i = 0; i < s.length; i++) a[i] = s.charCodeAt(i) & 0xff; return a; })();
+	for (let i = 0; i < source.length; i++) {
+		hash ^= source[i];
+		hash = Math.imul(hash, 0x01000193) >>> 0;
+	}
+	return ('00000000' + hash.toString(16)).slice(-8);
+}
+
 // Validate room data
 // 验证房间数据
 function validateRoomData(roomData) {
@@ -139,9 +157,12 @@ function handleShareAction() {
 	const encryptedPwd = password ? simpleEncrypt(password) : '';
 	
 	// Create share URL with encrypted data
+	// v= 为密码指纹（FNV-1a 8hex）；接收端解密密码后可校验链接是否被改动/截断
+	// v= is the password fingerprint (FNV-1a 8-hex); receivers can verify the link
+	// against the decrypted password
 	let url = `${location.origin}${location.pathname}?r=${encodeURIComponent(encryptedRoom)}`;
 	if (encryptedPwd) {
-		url += `&p=${encodeURIComponent(encryptedPwd)}`;
+		url += `&p=${encodeURIComponent(encryptedPwd)}&v=${passwordFingerprint(password)}`;
 	}
 	
 	copyToClipboard(url, t('action.share_copied', 'Share link copied!'), t('action.copy_url_failed', 'Copy failed, url:'));
@@ -172,7 +193,12 @@ export function renderMainHeader() {
 		onlineCount += 1
 	}
 	const safeRoomName = escapeHTML(roomName);
-	$id("main-header").innerHTML = `<button class="mobile-menu-btn"id="mobile-menu-btn"aria-label="Open Sidebar"><svg width="35px"height="35px"viewBox="0 0 24 24"fill="none"xmlns="http://www.w3.org/2000/svg"><g id="SVGRepo_bgCarrier"stroke-width="0"></g><g id="SVGRepo_tracerCarrier"stroke-linecap="round"stroke-linejoin="round"></g><g id="SVGRepo_iconCarrier"><path fill-rule="evenodd"clip-rule="evenodd"d="M21.4498 10.275L11.9998 3.1875L2.5498 10.275L2.9998 11.625H3.7498V20.25H20.2498V11.625H20.9998L21.4498 10.275ZM5.2498 18.75V10.125L11.9998 5.0625L18.7498 10.125V18.75H14.9999V14.3333L14.2499 13.5833H9.74988L8.99988 14.3333V18.75H5.2498ZM10.4999 18.75H13.4999V15.0833H10.4999V18.75Z"fill="#808080"></path></g></svg></button><div class="main-header-center"id="main-header-center"><div class="main-header-flex"><div class="group-title group-title-bold">#${safeRoomName}</div><span class="main-header-members">${onlineCount} ${t('ui.members', 'members')}</span><span class="voice-header-indicator" id="voice-header-indicator" style="display:none;"></span></div></div><div class="main-header-actions"><button class="more-btn"id="more-btn"aria-label="More Options"><svg width="35px"height="35px"viewBox="0 0 24 24"fill="none"xmlns="http://www.w3.org/2000/svg"><g id="SVGRepo_bgCarrier"stroke-width="0"></g><g id="SVGRepo_tracerCarrier"stroke-linecap="round"stroke-linejoin="round"></g><g id="SVGRepo_iconCarrier"><circle cx="12"cy="6"r="1.5"fill="#808080"></circle><circle cx="12"cy="12"r="1.5"fill="#808080"></circle><circle cx="12"cy="18"r="1.5"fill="#808080"></circle></g></svg></button><button class="mobile-info-btn"id="mobile-info-btn"aria-label="Open Members"><svg width="35px"height="35px"viewBox="0 0 24 24"fill="none"xmlns="http://www.w3.org/2000/svg"><g id="SVGRepo_bgCarrier"stroke-width="0"></g><g id="SVGRepo_tracerCarrier"stroke-linecap="round"stroke-linejoin="round"></g><g id="SVGRepo_iconCarrier"><path fill-rule="evenodd"clip-rule="evenodd"d="M16.0603 18.307C14.89 19.0619 13.4962 19.5 12 19.5C10.5038 19.5 9.10996 19.0619 7.93972 18.307C8.66519 16.7938 10.2115 15.75 12 15.75C13.7886 15.75 15.3349 16.794 16.0603 18.307ZM17.2545 17.3516C16.2326 15.5027 14.2632 14.25 12 14.25C9.73663 14.25 7.76733 15.5029 6.74545 17.3516C5.3596 15.9907 4.5 14.0958 4.5 12C4.5 7.85786 7.85786 4.5 12 4.5C16.1421 4.5 19.5 7.85786 19.5 12C19.5 14.0958 18.6404 15.9908 17.2545 17.3516ZM21 12C21 16.9706 16.9706 21 12 21C7.02944 21 3 16.9706 3 12C3 7.02944 7.02944 3 12 3C16.9706 3 21 7.02944 21 12ZM12 12C13.2426 12 14.25 10.9926 14.25 9.75C14.25 8.50736 13.2426 7.5 12 7.5C10.7574 7.5 9.75 8.50736 9.75 9.75C9.75 10.9926 10.7574 12 12 12ZM12 13.5C14.0711 13.5 15.75 11.8211 15.75 9.75C15.75 7.67893 14.0711 6 12 6C9.92893 6 8.25 7.67893 8.25 9.75C8.25 11.8211 9.92893 13.5 12 13.5Z"fill="#808080"></path></g></svg></button><div class="more-menu"id="more-menu"><div class="more-menu-item"data-action="share">${t('action.share', 'Share')}</div><div class="more-menu-item"data-action="exit">${t('action.exit', 'Quit')}</div></div></div>`;
+	// 密码指纹：跨设备一致 ⇔ 同一加密频道；同名不同密码的房间靠它肉眼区分
+	// Password fingerprint: equal across devices ⇔ same crypto Node (distinguishes
+	// same-name rooms that were created with different hidden passwords)
+	const pwdFp = rd ? passwordFingerprint(rd.password) : '';
+	const pwdFpHtml = pwdFp ? `<span class="pwd-fp" title="${t('ui.pwd_fingerprint_title', 'Password fingerprint (must match across devices)')}">${pwdFp}</span>` : '';
+	$id("main-header").innerHTML = `<button class="mobile-menu-btn"id="mobile-menu-btn"aria-label="Open Sidebar"><svg width="35px"height="35px"viewBox="0 0 24 24"fill="none"xmlns="http://www.w3.org/2000/svg"><g id="SVGRepo_bgCarrier"stroke-width="0"></g><g id="SVGRepo_tracerCarrier"stroke-linecap="round"stroke-linejoin="round"></g><g id="SVGRepo_iconCarrier"><path fill-rule="evenodd"clip-rule="evenodd"d="M21.4498 10.275L11.9998 3.1875L2.5498 10.275L2.9998 11.625H3.7498V20.25H20.2498V11.625H20.9998L21.4498 10.275ZM5.2498 18.75V10.125L11.9998 5.0625L18.7498 10.125V18.75H14.9999V14.3333L14.2499 13.5833H9.74988L8.99988 14.3333V18.75H5.2498ZM10.4999 18.75H13.4999V15.0833H10.4999V18.75Z"fill="#808080"></path></g></svg></button><div class="main-header-center"id="main-header-center"><div class="main-header-flex"><div class="group-title group-title-bold">#${safeRoomName}</div><span class="main-header-members">${onlineCount} ${t('ui.members', 'members')}</span>${pwdFpHtml}<span class="voice-header-indicator" id="voice-header-indicator" style="display:none;"></span></div></div><div class="main-header-actions"><button class="more-btn"id="more-btn"aria-label="More Options"><svg width="35px"height="35px"viewBox="0 0 24 24"fill="none"xmlns="http://www.w3.org/2000/svg"><g id="SVGRepo_bgCarrier"stroke-width="0"></g><g id="SVGRepo_tracerCarrier"stroke-linecap="round"stroke-linejoin="round"></g><g id="SVGRepo_iconCarrier"><circle cx="12"cy="6"r="1.5"fill="#808080"></circle><circle cx="12"cy="12"r="1.5"fill="#808080"></circle><circle cx="12"cy="18"r="1.5"fill="#808080"></circle></g></svg></button><button class="mobile-info-btn"id="mobile-info-btn"aria-label="Open Members"><svg width="35px"height="35px"viewBox="0 0 24 24"fill="none"xmlns="http://www.w3.org/2000/svg"><g id="SVGRepo_bgCarrier"stroke-width="0"></g><g id="SVGRepo_tracerCarrier"stroke-linecap="round"stroke-linejoin="round"></g><g id="SVGRepo_iconCarrier"><path fill-rule="evenodd"clip-rule="evenodd"d="M16.0603 18.307C14.89 19.0619 13.4962 19.5 12 19.5C10.5038 19.5 9.10996 19.0619 7.93972 18.307C8.66519 16.7938 10.2115 15.75 12 15.75C13.7886 15.75 15.3349 16.794 16.0603 18.307ZM17.2545 17.3516C16.2326 15.5027 14.2632 14.25 12 14.25C9.73663 14.25 7.76733 15.5029 6.74545 17.3516C5.3596 15.9907 4.5 14.0958 4.5 12C4.5 7.85786 7.85786 4.5 12 4.5C16.1421 4.5 19.5 7.85786 19.5 12C19.5 14.0958 18.6404 15.9908 17.2545 17.3516ZM21 12C21 16.9706 16.9706 21 12 21C7.02944 21 3 16.9706 3 12C3 7.02944 7.02944 3 12 3C16.9706 3 21 7.02944 21 12ZM12 12C13.2426 12 14.25 10.9926 14.25 9.75C14.25 8.50736 13.2426 7.5 12 7.5C10.7574 7.5 9.75 8.50736 9.75 9.75C9.75 10.9926 10.7574 12 12 12ZM12 13.5C14.0711 13.5 15.75 11.8211 15.75 9.75C15.75 7.67893 14.0711 6 12 6C9.92893 6 8.25 7.67893 8.25 9.75C8.25 11.8211 9.92893 13.5 12 13.5Z"fill="#808080"></path></g></svg></button><div class="more-menu"id="more-menu"><div class="more-menu-item"data-action="share">${t('action.share', 'Share')}</div><div class="more-menu-item"data-action="exit">${t('action.exit', 'Quit')}</div></div></div>`;
 	setupMoreBtnMenu();
 	setupMobileUIHandlers()
 }
@@ -419,7 +445,7 @@ function showSharePrompt() {
 	const encryptedRoom = simpleEncrypt(rd.roomName.trim());
 	let url = `${location.origin}${location.pathname}?r=${encodeURIComponent(encryptedRoom)}`;
 	if (rd.password) {
-		url += `&p=${encodeURIComponent(simpleEncrypt(rd.password))}`;
+		url += `&p=${encodeURIComponent(simpleEncrypt(rd.password))}&v=${passwordFingerprint(rd.password)}`;
 	}
 	const box = document.createElement('div');
 	box.className = 'login-modal';
@@ -588,6 +614,15 @@ export function autofillRoomPwd(formPrefix = '') {
 		// Show security warning for plaintext URLs
 		if (window.addSystemMsg) {
 			window.addSystemMsg(t('system.security_warning', '⚠️ This link uses an old format. Room data is not encrypted.'), true);
+		}
+	}
+	// 密码指纹校验：v= 与解密出的密码不符说明链接被改动/截断（如聊天工具转义）
+	// Fingerprint check: mismatch between v= and the decrypted password means the
+	// link was altered/truncated (e.g. by a chat app escaping it)
+	const linkFingerprint = params.get('v');
+	if (linkFingerprint && pwdValue && passwordFingerprint(pwdValue) !== linkFingerprint) {
+		if (window.addSystemMsg) {
+			window.addSystemMsg(t('system.share_verify_failed', 'Share link verification failed — the embedded password may have been altered or truncated. Ask the creator to re-copy the link.'), true);
 		}
 	}
 		// Fill in the form fields

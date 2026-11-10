@@ -227,10 +227,12 @@ export class VoiceChat {
 		const rd = roomsData[activeRoomIndex];
 		const userName = rd ? rd.myUserName : '';
 		if (this.directPeerId) {
-			// 一对一：提示正在邀请目标成员
-			// Direct mode: announce the invite to the target
-			const targetName = rd && rd.userMap && rd.userMap[this.directPeerId]
-				? (rd.userMap[this.directPeerId].userName || this.directPeerId)
+			// 一对一：提示正在邀请目标成员（userMap 存的字段是 username，缺兜底会显示 clientId）
+			// Direct mode: announce the invite to the target (userMap stores `username`;
+			// without the fallback chain the raw clientId is displayed)
+			const targetEntry = rd && rd.userMap && rd.userMap[this.directPeerId];
+			const targetName = targetEntry
+				? (targetEntry.userName || targetEntry.username || targetEntry.name || this.directPeerId)
 				: this.directPeerId;
 			addSystemMsg(t('voice.direct_starting', '{name} joined voice chat').replace('{name}', targetName));
 		} else {
@@ -289,8 +291,9 @@ export class VoiceChat {
 		this.startTimer();
 
 		const rd = roomsData[activeRoomIndex];
-		const callerName = rd && rd.userMap && rd.userMap[peerId]
-			? (rd.userMap[peerId].userName || peerId)
+		const callerEntry = rd && rd.userMap && rd.userMap[peerId];
+		const callerName = callerEntry
+			? (callerEntry.userName || callerEntry.username || callerEntry.name || peerId)
 			: peerId;
 		addSystemMsg(t('voice.direct_incoming', '{name} invited you to a one-on-one call — connecting automatically').replace('{name}', callerName));
 
@@ -659,12 +662,13 @@ export class VoiceChat {
 		if (this.directPeerId) {
 			// 一对一通话中：只关心对方；对方离开/下线 → 自动挂断
 			// In a direct call: only the target matters; if they leave, hang up automatically
-			if (peerId !== this.directPeerId) return;
+			if (this.directPeerId !== peerId) return;
 			this.closePeerConnection(peerId);
 			this.activeCallers.delete(peerId);
 			const rd = roomsData[activeRoomIndex];
-			const name = rd && rd.userMap && rd.userMap[peerId]
-				? (rd.userMap[peerId].userName || peerId)
+			const leaveEntry = rd && rd.userMap && rd.userMap[peerId];
+			const name = leaveEntry
+				? (leaveEntry.userName || leaveEntry.username || leaveEntry.name || peerId)
 				: peerId;
 			if (this.isInCall) {
 				addSystemMsg(t('voice.user_left', '{name} left voice chat').replace('{name}', name));

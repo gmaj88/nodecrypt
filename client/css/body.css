@@ -516,6 +516,17 @@ body {
 	color: #888;
 }
 
+/* 密码指纹徽标：用于跨设备比对是否同一加密频道 / Password fingerprint badge
+ * to compare whether devices joined the same crypto Node */
+.main-header-flex .pwd-fp {
+	margin-left: 6px;
+	font-size: 10px;
+	color: #9aa0a6;
+	letter-spacing: 1px;
+	cursor: default;
+	user-select: all;
+}
+
 .img-modal-content-overflow {
 	overflow: hidden;
 }

@@ -52,6 +52,10 @@ export class ChatRoom {  constructor(state, env) {
     
     this.config = {
       seenTimeout: 60000,
+      // 周期清理 alarm 间隔：不再依赖"有人新连接"才触发 cleanupOldConnections，
+      // 旧连接的超时清理与成员变化广播由 alarm 兜底
+      // Periodic-cleanup alarm interval: cleanup no longer depends on new connections
+      cleanupInterval: 15000,
       debug: false
     };
     
@@ -221,6 +225,11 @@ export class ChatRoom {  constructor(state, env) {
       channel: null
     };
 
+    // 新连接确保周期清理 alarm 在位（空转时由 cleanup 取消）
+    // New connection: make sure the periodic cleanup alarm is scheduled
+    // (cleanup cancels it when no clients remain)
+    await this.scheduleCleanupAlarm();
+
     // Send RSA public key
     try {
       logEvent('sending-public-key', clientId, 'debug');
@@ -244,7 +253,6 @@ export class ChatRoom {  constructor(state, env) {
         this.sendMessage(connection, 'pong');
         return;
       }
-
       logEvent('message', [clientId, message], 'debug');      // Handle key exchange
       if (!this.clients[clientId].shared && message.length < 2048) {
         try {
@@ -321,27 +329,34 @@ export class ChatRoom {  constructor(state, env) {
       const channel = clientInfo ? (clientInfo.channel || null) : null;
 
       if (channel && this.channels[channel]) {
-        this.channels[channel].splice(this.channels[channel].indexOf(clientId), 1);
+        // 用 filter 摘除成员：旧实现用 indexOf+splice，若 indexOf 为 -1
+        // 会误删数组最后一个成员；且仅在确实发生变化时广播
+        // Remove via filter: the old indexOf+splice dropped the wrong member on -1;
+        // broadcast only when membership actually changed
+        const remaining = this.channels[channel].filter((id) => id !== clientId);
+        if (remaining.length !== this.channels[channel].length) {
+          this.channels[channel] = remaining;
 
-        if (this.channels[channel].length === 0) {
-          delete(this.channels[channel]);
-        } else {
-          try {
-            const members = this.channels[channel];
+          if (remaining.length === 0) {
+            delete(this.channels[channel]);
+          } else {
+            try {
+              const members = this.channels[channel];
 
-            for (const member of members) {
-              const client = this.clients[member];              if (this.isClientInChannel(client, channel)) {
-                this.sendMessage(client.connection, encryptMessage({
-                  a: 'l',
-                  p: members.filter((value) => {
-                    return (value !== member ? true : false);
-                  })
-                }, client.shared));
+              for (const member of members) {
+                const client = this.clients[member];              if (this.isClientInChannel(client, channel)) {
+                  this.sendMessage(client.connection, encryptMessage({
+                    a: 'l',
+                    p: members.filter((value) => {
+                      return (value !== member ? true : false);
+                    })
+                  }, client.shared));
+                }
               }
-            }
 
-          } catch (error) {
-            logEvent('close-list', [clientId, error], 'error');
+            } catch (error) {
+              logEvent('close-list', [clientId, error], 'error');
+            }
           }
         }
       }
@@ -578,13 +593,32 @@ export class ChatRoom {  constructor(state, env) {
       }
     }
 
+    // 发生成员变化的频道集合：循环结束后统一补播一次成员表
+    // Channels with membership changes: rebroadcast once after the loop
+    const affectedChannels = new Set();
+
     // 然后一次性移除所有过期客户端
     for (const clientId of clientsToRemove) {
       try {
         logEvent('connection-seen', clientId, 'debug');
         // close 时 clients 已被删除，这里统一补齐设备离线标记
         // close event won't find the client anymore, so mark push devices offline here
-        const removedChannel = this.clients[clientId] ? this.clients[clientId].channel : null;
+        const removed = this.clients[clientId];
+        const removedChannel = removed ? removed.channel : null;
+        // 必须先从频道成员表同步摘除：若只删 clients 而不摘 channels，
+        // close 事件回调会查不到 client，该 ID 将永久残留为僵尸成员
+        // Must splice from channels synchronously: the close handler looks up
+        // this.clients[clientId], which is gone by then, so without a splice the
+        // stale ID would linger in channels[] forever as a ghost member
+        if (removedChannel && this.channels[removedChannel]) {
+          const remaining = this.channels[removedChannel].filter((id) => id !== clientId);
+          if (remaining.length === 0) {
+            delete this.channels[removedChannel];
+          } else if (remaining.length !== this.channels[removedChannel].length) {
+            this.channels[removedChannel] = remaining;
+            affectedChannels.add(removedChannel);
+          }
+        }
         if (removedChannel) {
           try {
             await markDeviceOffline(this.state.storage, removedChannel, clientId);
@@ -592,23 +626,73 @@ export class ChatRoom {  constructor(state, env) {
             logEvent('cleanup-device-offline', [clientId, error], 'error');
           }
         }
-        this.clients[clientId].connection.close();
+        if (removed && removed.connection) {
+          try {
+            removed.connection.close();
+          } catch (error) {
+            logEvent('close-stale-connection', [clientId, error], 'error');
+          }
+        }
         delete this.clients[clientId];
       } catch (error) {
-        logEvent('connection-seen', error, 'error');      }
+        logEvent('connection-seen', error, 'error');
+      }
     }
-    
+
+    // 对每个发生成员变化的频道补播成员表 —— 等待中的新成员靠这条恢复握手，
+    // 否则要等下一个 join/close 事件才会再广播
+    // Rebroadcast for each changed channel — pending joiners rely on this to
+    // resume their handshake instead of waiting for the next join/close event
+    for (const channel of affectedChannels) {
+      this.broadcastMemberList(channel);
+    }
+
     // 如果没有任何客户端和房间，检查是否需要轮换密钥
     if (Object.keys(this.clients).length === 0 && Object.keys(this.channels).length === 0) {
       const pendingRotation = await this.state.storage.get('pendingKeyRotation');
       if (pendingRotation) {
         console.log('没有活跃客户端或房间，执行密钥轮换...');
-        await this.state.storage.delete('rsaKeyPair');        await this.state.storage.delete('pendingKeyRotation');
+        await this.state.storage.delete('rsaKeyPair');
+        await this.state.storage.delete('pendingKeyRotation');
         this.keyPair = null;
         await this.initRSAKeyPair();
       }
     }
-    
+
+    // 仍有客户端 → 续约周期清理 alarm；全部清空 → 取消 alarm 让 DO 真正空闲
+    // Clients remain → renew the periodic cleanup alarm; empty → cancel it so the DO can idle
+    try {
+      if (Object.keys(this.clients).length === 0) {
+        await this.state.storage.deleteAlarm();
+      } else if (clientsToRemove.length > 0) {
+        await this.scheduleCleanupAlarm();
+      }
+    } catch (error) {
+      logEvent('cleanup-alarm', error, 'error');
+    }
+
     return clientsToRemove.length; // 返回清理的连接数量
+  }
+
+  // 预约下一次周期清理（DO alarm）：无活跃客户端时也可被 alarm()/handleSession 调用
+  // Schedule the next periodic cleanup (DO alarm)
+  async scheduleCleanupAlarm() {
+    try {
+      await this.state.storage.setAlarm(Date.now() + this.config.cleanupInterval);
+    } catch (error) {
+      logEvent('schedule-cleanup-alarm', error, 'error');
+    }
+  }
+
+  // DO alarm 回调：周期执行清理，保证仅在 join/close 触发清理时不会被漏掉的
+  // 半开连接最终也能被摘除并广播
+  // DO alarm callback: run cleanup periodically so half-open sockets that no
+  // join/close event would surface still get reaped and members rebroadcast
+  async alarm() {
+    try {
+      await this.cleanupOldConnections();
+    } catch (error) {
+      logEvent('alarm-cleanup', error, 'error');
+    }
   }
 }

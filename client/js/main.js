@@ -79,6 +79,9 @@ import {	renderUserList,       // 渲染用户列表 / Render user list
 	initLoginForm,        // 初始化登录表单 / Initialize login form
 	initFlipCard          // 初始化翻转卡片功能 / Initialize flip card functionality
 } from './ui.js';
+import {
+	escapeHTML            // HTML 转义（昵称拼接 innerHTML 前必须转义）/ HTML escape
+} from './util.string.js';
 
 // 导入语音聊天模块 / Import voice chat module
 import { initVoiceChat, getVoiceChat, VoiceChat } from './util.voice.js';
@@ -320,8 +323,10 @@ window.addEventListener('DOMContentLoaded', () => {
 		}
 		const overlay = document.createElement('div');
 		overlay.className = 'voice-direct-modal';
+		// 昵称来自其他客户端（user-controlled），拼入 innerHTML 前必须转义
+		// Nicknames come from other clients (user-controlled) — must escape before innerHTML
 		const items = members.map(m =>
-			`<div class="voice-direct-item" data-peer="${m.peerId}"><span class="member-name">${m.name}</span></div>`
+			`<div class="voice-direct-item" data-peer="${m.peerId}"><span class="member-name">${escapeHTML(m.name)}</span></div>`
 		).join('');
 		overlay.innerHTML = `<div class="voice-direct-card"><div class="voice-direct-title">${t('voice.direct_pick_title', 'One-on-one call · pick a member')}</div><div class="voice-direct-list">${items}</div></div>`;
 		document.body.appendChild(overlay);

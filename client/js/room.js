@@ -29,7 +29,7 @@ let activeRoomIndex = -1;
 
 // Get a new room data object
 // 获取一个新的房间数据对象
-export function getNewRoomData() {
+export function 	getNewRoomData() {
 	return {
 		roomName: '',
 		userList: [],
@@ -157,6 +157,7 @@ export function joinRoom(userName, roomName, password, modal = null, onResult) {
 			addSystemMsg(t('system.secured', 'connection secured'))
 		},
 		onClientSecured: (user) => handleClientSecured(idx, user),
+		onClientPending: (info) => handleClientPending(idx, info),
 		onClientList: (list, selfId) => handleClientList(idx, list, selfId),
 		onClientLeft: (clientId) => handleClientLeft(idx, clientId),
 		onClientMessage: (msg) => handleClientMessage(idx, msg)
@@ -201,6 +202,9 @@ export function handleClientList(idx, list, selfId) {
 export function handleClientSecured(idx, user) {
 	const rd = roomsData[idx];
 	if (!rd) return;
+	if (rd.pendingShown) {
+		delete rd.pendingShown[user.clientId]
+	}
 	rd.userMap[user.clientId] = user;
 	const existingUserIndex = rd.userList.findIndex(u => u.clientId === user.clientId);
 	if (existingUserIndex === -1) {
@@ -233,11 +237,33 @@ export function handleClientSecured(idx, user) {
 	}
 }
 
+// Handle a member that never completes the E2E handshake (8s after appearing in
+// the member list): almost certainly a password mismatch, e.g. someone typed the
+// room name manually instead of joining via the share link — make it visible
+// instead of silently rendering both sides invisible
+// 处理 8 秒后仍未完成加密握手的成员：几乎一定是密码不一致
+// （如手动输入房间名而非通过分享链接加入），把静默隐身变成可见提示
+export function handleClientPending(idx, info) {
+	const rd = roomsData[idx];
+	if (!rd || !info || !info.clientId) return;
+	rd.pendingShown = rd.pendingShown || {};
+	if (rd.pendingShown[info.clientId]) return;
+	rd.pendingShown[info.clientId] = true;
+	const msg = t('system.pending_handshake', '[Notice] A member failed to complete the encrypted handshake — usually a password mismatch. Join existing Nodes via the correct share link.');
+	if (rd.messages) {
+		rd.messages.push({ type: 'system', text: msg });
+	}
+	if (activeRoomIndex === idx) addSystemMsg(msg, true);
+}
+
 // Handle client left event
 // 处理客户端离开事件
 export function handleClientLeft(idx, clientId) {
 	const rd = roomsData[idx];
 	if (!rd) return;
+	if (rd.pendingShown) {
+		delete rd.pendingShown[clientId]
+	}
 	if (rd.privateChatTargetId === clientId) {
 		rd.privateChatTargetId = null;
 		rd.privateChatTargetName = null;

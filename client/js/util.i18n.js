@@ -29,6 +29,7 @@ const LANGUAGES = {
 			'ui.password_auto_hint': '[ Password will be generated automatically — invite friends via share link ]',
 			'ui.my_name': 'My Name',
 			'ui.members': 'Members',
+			'ui.pwd_fingerprint_title': 'Password fingerprint — must match across devices for the same Node',
 			'ui.message': 'Message',
 			'ui.private_message_to': 'Private Message to',
 			'ui.me': ' (me)',
@@ -96,6 +97,8 @@ const LANGUAGES = {
 			'system.private_message_failed': 'Cannot send private message to',
 			'system.private_file_failed': 'Cannot send private file to',
 			'system.user_not_connected': 'User might not be fully connected.',
+			'system.pending_handshake': '[Notice] A member failed to complete the encrypted handshake — usually a password mismatch (joined by typing the room name instead of using the share link). Ask the creator to resend the share link.',
+			'system.share_verify_failed': 'Share link verification failed — the embedded password may have been altered or truncated. Ask the creator to re-copy the link.',
 					// Voice chat
 			'voice.join_call': 'Join Voice Chat',
 			'voice.leave_call': 'Leave Voice Chat',
@@ -189,6 +192,7 @@ const LANGUAGES = {
 			'ui.password_auto_hint': '[ 密码会自动生成，请凭分享链接邀请好友 ]',
 			'ui.my_name': '我的名字',
 			'ui.members': '在线成员',
+			'ui.pwd_fingerprint_title': '密码指纹——多端一致即为同一频道',
 			'ui.message': '消息',
 			'ui.private_message_to': '私信给',
 			'ui.me': '（我）',
@@ -256,6 +260,8 @@ const LANGUAGES = {
 			'system.private_message_failed': '无法发送私信给',
 			'system.private_file_failed': '无法发送私密文件给',
 			'system.user_not_connected': '用户可能未完全连接。',
+			'system.pending_handshake': '[提示] 有成员未能完成加密握手——通常是密码不一致（手动输入房间名而非通过分享链接加入）。请房主重新发送分享链接。',
+			'system.share_verify_failed': '分享链接校验失败——链接中的密码可能被改动或截断，请房主重新复制链接。',
 					// Voice chat
 			'voice.join_call': '加入语音通话',
 			'voice.leave_call': '离开语音通话',

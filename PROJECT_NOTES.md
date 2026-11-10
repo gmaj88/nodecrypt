@@ -354,3 +354,22 @@ localStorage.removeItem('nodecrypt-debug');     // 关（默认）
 - **web 房间不持久化**：`roomsData` 仅内存；刷新后列表清空，重进必须靠分享链接（浏览器侧可收藏链接当凭据）。APP 端有本地持久化（store.js），不受影响。
 - **兼容防线**：`autofillRoomPwd` 对带 r/node 参数（含旧"无密码链接"）打下 `form.dataset.fromLink=1` 旗标——链接进入一律按原凭据进房，绝不生成新密码；仅"手输名字+密码框为空+无旗标"三条件齐备才判定为新建。
 - **HTML5 校验坑**：`display:none` 的 input 带 `minlength` 会导致提交时报 "not focusable" 静默失败——隐藏密码框必须去掉 `minlength`（已改）。
+
+### 13.15 在线状态自愈与"静默隐身"可观测性（2026-11-10 定案）
+- **症状回顾**：三端同房（电脑浏览器+2 手机 APP），新加入的人约 1 分钟才互相可见；期间**文字消息同样延迟/丢失**，**无任何操作到点自动恢复**；复现点：新加入者看不到别人、别人也看不到他，先来的两人互发正常。
+- **根因（不是网速/带宽）**：①客户端 `pong` 被直接忽略（此前 ping 只发不判）——socket 半开/网络瞬时断链时客户端无感知，要等 **OS TCP 重传超时（实测 ~60s）** 才触发 onclose→3s 重连，期间的握手/消息全部滞留或丢失；②服务端 `cleanupOldConnections` 只在**有人新连接**时才跑，且此前先 `delete clients` 后才让 close 回调摘除成员——摘不掉，`channels[]` 残留僵尸 ID 且**不补播成员表**；③成员表 `l` 只由 join/close 触发，握手消息一旦丢包没有重试路径（`l` 分支只对"无条目"的 peer 发 `w`，条目存在但没握完就永远不再发）。
+- **客户端自愈（NodeCrypt.js）**：
+  - `pingInterval` 20s→**10s**；新增 `lastPongAt` + **pongTimeout=25s 看门狗**（pong 分支更新时间戳；ping 时超期即 `forceReconnect` 走既有 onclose→3s 重连）——最坏不可见时间从 ~60s 压到 ~30s；
+  - `visibilitychange`(visible)/`online`/`focus` 触发连通性检查：CONNECTING 不打断（防重连风暴）、CLOSED 立即 `connect()`、OPEN 但 `lastPongAt` 过期先发探测 ping，3s 无 pong 强制重连；
+  - `l` 分支对**未完成握手**的条目（缺 `shared` 或 `username`）**复用旧密钥对重发 `w`**；`c` 处理新增"收到 64hex 明文公钥=对方在请求重新握手"识别——条目已有 `shared` 时**用既有 shared 补发 `u`**（服务端重播成员表即可驱动双向重握手）；
+  - debug 时间线（`nodecrypt-debug=1`）：connect→open 耗时、pong RTT、`l` 成员数/重发数、close/forceReconnect 原因。
+- **服务端对账（worker/index.js）**：
+  - `cleanupOldConnections` 先同步从 `channels[]` filter 摘除（保留属主），循环结束对每个受影响频道**补播成员表**，再 close/delete；close 回调同步改用 filter（原 `indexOf+splice` 在 -1 时**会误删最后一个成员**）；
+  - 新增 **DO alarm 周期清理**（`cleanupInterval=15s`）：`handleSession` 建新连接时预约、`cleanupOldConnections` 尾部有客户端则续约/无客户端则 `deleteAlarm()`；半开连接不再依赖"下一个 join"才被发现；
+  - 心跳语义不变：服务端每条入站消息刷新 `seen`，`seenTimeout` 仍 60s（>60s 静默即按半开处理）。
+- **静默隐身可见化（防密码不一致被误读为网络问题）**：
+  - 8 秒仍未完成握手的成员 → `onClientPending` 回调 → 系统提示「有成员未能完成加密握手——通常是密码不一致（手动输入房间名而非通过分享链接加入）」（`system.pending_handshake`，每个 peer 一次，secured/left 时清除）；
+  - **密码指纹**：分享链接/APP 打开页 URL 追加 `v=`（FNV-1a 32bit 8hex，客户端 `ui.js` 与 APP `codec.js` 算法一致）；接收端与解密出的密码比对（web 在 `autofillRoomPwd`、APP 在粘贴链接时），不符提示"链接可能被改动或截断"（`system.share_verify_failed`）；
+  - **频道头部显示指纹徽标**（`.pwd-fp`，8hex、可选中复制）：多端一致=同一加密频道——用于区分"同名不同密码的独立房间"（13.14 的推送串频场景肉眼可判）。
+- **语音昵称 bug（顺手修复）**：`util.voice.js` 三处（发起邀请/被叫来电提示/对方离开）只查 `.userName`，而 `userMap` 实际字段是 `.username` → 一对一通话提示显示的是 **clientId**；现按 `userName||username||name||peerId` 兜底。另修 `main.js` 选人面板昵称拼接未 `escapeHTML`（user-controlled XSS 兜底）。
+- **遗留（另行立项）**：`handleServerKey` 直接信任服务端发来的 RSA 公钥并写入 `nodecrypt_server_key`（只写不读）——服务端公钥可被 MITM 替换，削弱 E2EE 声明；建议后续做首次连接钉扎（TOFU）+ 公钥指纹显示。

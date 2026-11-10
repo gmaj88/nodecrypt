@@ -316,6 +316,10 @@
 		font-size: 12px;
 	}
 
+	.pwd-fp {
+		letter-spacing: 0.5px;
+	}
+
 	.voice-header-indicator {
 		margin-left: 0;
 	}
