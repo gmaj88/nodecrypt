@@ -374,15 +374,12 @@ localStorage.removeItem('nodecrypt-debug');     // 关（默认）
 - **语音昵称 bug（顺手修复）**：`util.voice.js` 三处（发起邀请/被叫来电提示/对方离开）只查 `.userName`，而 `userMap` 实际字段是 `.username` → 一对一通话提示显示的是 **clientId**；现按 `userName||username||name||peerId` 兜底。另修 `main.js` 选人面板昵称拼接未 `escapeHTML`（user-controlled XSS 兜底）。
 - **遗留（另行立项）**：`handleServerKey` 直接信任服务端发来的 RSA 公钥并写入 `nodecrypt_server_key`（只写不读）——服务端公钥可被 MITM 替换，削弱 E2EE 声明；建议后续做首次连接钉扎（TOFU）+ 公钥指纹显示。
 
-### 13.16 后台推送改版：通知消息 + 可见性主动离线 + 同名隔离（2026-11-11 定案）
-- **双根因回顾**：①在线设备收不到推送——`listOfflineDevices` 跳过 `record.online`，聊天页退后台 web-view 存活、WS 不断（`chat.vue` unload 才会断），设备永远"在线"，服务端根本不发；要等 `seenTimeout=60s` 清理才短暂离线。②离线/在线通道都用透传（`push_message.transmission`）——后台 JS 被 Android 冻结后无人创建本地通知，"收不到"；APP 打开才补投。
-- **在线通道 transmission → notification**（`worker/push.js buildPushBody`）：`push_message.notification = { title, body, channel_id:'nodecrypt', channel_name:'消息提醒', channel_level:4, ...vendorNotification }`——由个推 SDK/厂商系统原生弹通知栏，**后台冻结也能弹**；`click_type:'intent'` + intent 内 `S.payload=hash` 与厂商通道同构，点击路由复用既有 `extractHash`（intent payload + 正文 `[hash12]` 双保险）。字段合法性经个推官方文档核实（notification 支持 title/body/channel_id/channel_name/channel_level/click_type/intent）。`push_channel`/`options.HW` 未动。
-- **可见性主动离线（关键新机制）**：
-  - web（`NodeCrypt.js`）：`appHidden` 状态 + `setAppHidden(hidden)`（去重早退）+ `sendVisibility()`（加密控制消息 `{a:'v', p:0/1}`，守卫 `serverShared && isOpen()`）；`visibilitychange` 双向分支（visible 时顺带连通性检查）；重连/入房注册推送 token 后若仍 `appHidden` 补报 `p:0`；`destruct()` 从 `ncInstances` 注册表摘除。
-  - Android WebView 的 Page Visibility 不可靠（退后台不触发）→ APP 原生兜底：`chat.vue` 在 `onHide`/`onShow` 经 `evalJS` 调 `window.__ncSetHidden(1/0)`（`$getAppWebview().children()[0]`，文件尾定义一次、fan-out 所有实例、单实例异常不中断）。
-  - worker（`index.js`）：action `'v'` → `handleVisibility`（校验 `p` 为 0/1）→ `push.js setDeviceOnline(storage, channelHash, clientId, online)`——只改 `link === clientId` 设备记录的 `online`/`seen`，**不关 WS**；退后台即刻成为离线推送目标，不再等 seenTimeout。
-- **未读双计去重（store.js 共享标记）**：同一条消息可能同时经 WS 桥接（chat.vue 页面隐藏时 `incrementUnreadByHash`）与离线推送 receive（App.vue）到达——内存态标记 `markUnreadCounted(hash)`/`wasUnreadCountedWithin(hash, ms)`（hash 前 8 位 hex 为 key，不持久化）：receive/桥接计数前查 **5 秒**窗口；点击路径查 **5 分钟**窗口（原 `receiveCountedAt` 语义，`receiveCountedAt` 机制删除）；厂商冷启动点击无标记照常计 1。
-- **App.vue receive 不再弹本地通知**：在线通道已是通知消息，`notifyLocalPush`（`plus.push.createMessage`）会双份——方法整体删除，前台提示=未读计数+桌面角标；`activeRoomHash` 正在渲染时仍跳过计数（WS 已实时送达并标已读）。
-- **同名隔离改版（§13.14 收尾）**：路由键改为 `sha256(房间名 + '\u0000' + 密码)`（web `setCredentials` 与 APP `store.js channelHash` 同公式；`credentials.password` 仍为 `sha256(password)`，握手不变；输出仍 64 hex → `[hash12]` 长度不变）。APP 侧 `readList()` 一次性迁移（旧记录按新公式重算回写）；`addOrMergeChannel` 合并更新密码时同步重算 hash。**上线必做**：每个频道重进一次（cid 在新 hash 下重新注册）；测试阶段不留兼容层——旧 APK + 新 web 的同名房间 hash 不一致（可接受）。
-- **已知局限（按验证矩阵预期）**：厂商通知点击体无法客户端取证；无厂商通道的机型（OPPO）杀进程/冻结后仍收不到（厂商通道白名单限制）；后台 JS 挂起时首页角标可能滞后、点击通知后补计；补报机制依赖退后台前 WS 存活（已被 kill 则本来就离线，`close` 回调兜底）。
-- **验证矩阵（OPPO/WIKO + `/api/push-test?hash=<hash>&notifylog=1&push=1`）**：①首页退后台任意本地频道来消息 → 系统通知栏（需先重进频道一次完成 cid 注册）；②聊天页退后台 5 秒内来消息 → 通知栏；③点通知 → 直达频道且角标正确；④杀进程：OPPO 无（预期）、WIKO 华为横幅；⑤同一消息角标只 +1。
+### 13.16 后台推送改版尝试 → 已整体回退，仅保留同名隔离（2026-11-11 定案）
+- **尝试内容**：在线通道 transmission→notification（SDK 原生弹通知栏）、web/APP 可见性上报 `a:'v'` 主动离线（`setDeviceOnline`/`__ncSetHidden`/chat.vue evalJS）、未读双计去重（store.js 共享标记）、App.vue 去掉 `notifyLocalPush`。已部署一版（da024db）后**全部回退**（worker 两个文件 checkout 回 a6318c4，client 只保留 hash 公式）。
+- **回退根因（OPPO 实测）**：
+  - **角标消失**：通知消息由个推 SDK 原生弹栏，**不触发 uni-app `receive` 回调** → 杀进程/后台后打开 APP，未读计数/首页角标代码根本没跑；只有点通知（click）才计一次。透传模式的重开补投会触发 receive → 立即计未读+出角标（用户要的既有行为）。
+  - **OPPO 退后台/杀进程仍收不到**：OPPO 无厂商通道（仅华为已配），透传/通知都依赖个推在线通道或厂商离线库补投——本就无解，改通知消息没有带来增益。
+  - **进聊天室看到对方变慢**：可见性上报不碰握手/成员表，非直接原因；更可能是 hash 含密码改版（§13.14 收尾）的过渡摩擦——旧标签页/旧缓存 JS 按旧 hash 进房、新端按新 hash 进房，不同频道互相不可见，要等一端刷新/重连到新 hash 才"突然可见"。浏览器强刷 + APP 重打包 + 每频道重进一次后消失。
+- **保留项（唯一存活改动）**：频道/推送桶 hash = `sha256(房间名 + NUL + 密码)`（web `setCredentials` + APP `store.js channelHash`/`readList` 迁移/`addOrMergeChannel` 重算），同名不同密码彻底隔离（§13.14）。推送链路恢复透传+客户端本地通知（`notifyLocalPush`+`receiveCountedAt`）原逻辑。
+- **教训**：①改推送形态前先确认它会触发哪条 uni-app 回调（receive/click/launch）——通知消息不触发 receive，角标链路直接断；②测试机只覆盖 OPPO（无厂商通道）时，"改通知消息"类方案无验证途径；③一次性上多组改动（推送形态+可见性+去重+hash）出问题时无法归因，回退也只能整体回。
+- **若重启后台推送课题**：前置条件是 OPPO 配置厂商通道（可信），且方案必须保证 receive 触发（或补一条客户端计数路径）；可见性上报/通知消息代码可从本节 git 历史找回。

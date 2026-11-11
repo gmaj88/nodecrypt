@@ -164,35 +164,6 @@ export async function markDeviceOffline(storage, channelHash, clientId) {
 	}
 }
 
-// 可见性上报：客户端退后台（a:'v' p:0）时把本连接关联的设备立即转为离线推送目标，
-// 无需等待 seenTimeout 清理；回前台（p:1）转回在线。WS 保持连接不受影响。
-// Visibility reporting: on background (a:'v' p:0) the device linked to this connection
-// becomes an offline-push target immediately (no seenTimeout wait); foreground (p:1)
-// flips it back. The WS connection itself is untouched.
-export async function setDeviceOnline(storage, channelHash, clientId, online) {
-	try {
-		const key = `devices:${channelHash}`;
-		const devices = (await storage.get(key)) || {};
-		const now = Date.now();
-		let changed = false;
-		for (const token in devices) {
-			const record = devices[token];
-			if (record.link === clientId) {
-				record.online = online ? 1 : 0;
-				record.seen = now;
-				changed = true;
-			}
-		}
-		if (changed) {
-			await storage.put(key, devices);
-		}
-		return changed;
-	} catch (error) {
-		console.error('setDeviceOnline error', error);
-		return false;
-	}
-}
-
 // 离线厂商通知体：标题/内容 + 点击跳转行为
 // Offline vendor notification: title/body + click behaviour
 // 离线送达必须带 push_channel（厂商通道）：只写 push_message 时消息仅存个推离线库，
@@ -267,32 +238,21 @@ function buildPushBody(env, channelHash, audienceCid, testMessage) {
 		request_id: requestId(),
 		audience: { cid: [audienceCid] },
 		settings: { ttl: 3600000, strategy: { default: 4 } },
-		// 在线个推通道改用通知消息（原为透传）：通知由个推 SDK 原生展示在系统通知栏，
-		// 不依赖 APP 的 JS 是否在跑。此前透传在后台被 Android 冻结 JS 后无人展示，
-		// 正是"APP 不在前台就收不到推送"的根因之一（另一根因是设备被标为在线时
-		// 服务器根本不发推送——见 handleVisibility/可见性上报）。
-		// 设备在线时服务器本来就不推（WS 直达房间），因此不会打扰正在看房间的用户；
-		// 离线/隐藏设备走本通知或 push_channel 厂商通道。
-		// 点击路由双保险：intent 内 S.payload=hash（与厂商通道同构）+ 正文 [hash12]
-		// 标记（extractHash 从 content 兜底解析）。
-		// Online Getui channel now sends a NOTIFICATION message (was transmission): the
-		// Getui SDK shows the tray natively, no app JS needed. Transmission relied on
-		// JS that Android freezes in background - one root cause of "no push while the
-		// app is not in foreground" (the other: devices still marked online never got
-		// pushed at all - see the visibility reporting). Online (WS-connected) devices
-		// are never pushed anyway, so an actively-viewed room is never disturbed.
-		// Click routing has two independent paths: S.payload=hash inside the intent
-		// (same as the vendor channel) and the [hash12] body tag parsed by extractHash.
+		// 在线个推通道改用透传：APP 进程存活（前台/后台）即触发 receive，
+		// 由客户端计数角标 + 弹本地通知 —— 修复"通知栏消息在线送达但前台不弹、
+		// APP 进程死时被吞且个推视为成功不进离线库"的消息黑洞。
+		// 杀进程场景：厂商离线通知（横幅可点直达）或离线库补投（APP 打开时 receive）。
+		// Online Getui channel uses transmission: any live app process (foreground or
+		// background) fires receive, so the client counts the badge and pops a local
+		// notification itself — fixes the black hole where an online "notification"
+		// message was counted delivered while the app process was dead/foreground.
+		// Killed phones: vendor offline notification banner, or offline-store redelivery.
+		// 透传 payload 统一为人话（有新消息 [hash12] YYYY-MM-DD HH:MM）——用户定稿格式；
+		// 厂商通知 title/body 同源（notifyBody），所有链路正文口径一致。
+		// Transmission payload = the canonical human text (NOTIFY_BODY [hash12] date time);
+		// vendor notification shares notifyBody so every path speaks the same prose.
 		push_message: {
-			notification: Object.assign({
-				title: titleText,
-				body: bodyText,
-				// Android 8+ 按通知渠道控制展示：固定一个高优先级渠道，避免被 ROM 折叠/静默
-				// Android 8+ gates display per notification channel; pin a high-priority one
-				channel_id: 'nodecrypt',
-				channel_name: '消息提醒',
-				channel_level: 4
-			}, vendorNotification)
+			transmission: notifyBody(payloadText)
 		},
 		push_channel: {
 			android: {
