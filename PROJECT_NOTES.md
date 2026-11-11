@@ -350,7 +350,7 @@ localStorage.removeItem('nodecrypt-debug');     // 关（默认）
 
 ### 13.14 创建/加入模型改版边界（2026-11-09 定案）
 - **模型**：创建=只输房间名（密码自动生成、隐藏、不可输）；加入=分享链接。适用于 web（首页表单）与 APP（"+"添加弹窗）两端一致。
-- **同名不同密码 ≠ 隔离推送**：房间/推送路由键是 `sha256(房间名)`，服务端不知道密码——同名不同密码的两个房间消息互通不可见（密钥不同），但**会互相收到"有新消息"提醒/角标**（内容不泄密，仅提醒串频）。彻底隔离必须房间名不同；协议层把房间标识改为含密码派生值改动大，暂不做。
+- **同名不同密码 ≠ 隔离推送**（**已于 2026-11-11 改版解决，见 §13.16**）：原状房间/推送路由键是 `sha256(房间名)`，服务端不知道密码——同名不同密码的两个房间消息互通不可见（密钥不同），但**会互相收到"有新消息"提醒/角标**（内容不泄密，仅提醒串频）。现路由键改为 `sha256(房间名 + NUL + 密码)`（web `NodeCrypt.setCredentials` 与 APP `store.js channelHash` 同公式），同名不同密码在 WS 频道、设备注册、离线推送三条链路上**彻底隔离**；同名+同密码（分享链接进入）仍为同一房间。**注意**：hash 输入含密码 → 服务器可见"密码派生标识"（与既有 `sha256(password)` 握手暴露面同量级，密码不可逆推）；改版后旧 hash 下的设备注册失效——APP 本地记录由 `readList()` 迁移重算，但 cid 须**重新进入频道一次**才在新 hash 下注册。
 - **web 房间不持久化**：`roomsData` 仅内存；刷新后列表清空，重进必须靠分享链接（浏览器侧可收藏链接当凭据）。APP 端有本地持久化（store.js），不受影响。
 - **兼容防线**：`autofillRoomPwd` 对带 r/node 参数（含旧"无密码链接"）打下 `form.dataset.fromLink=1` 旗标——链接进入一律按原凭据进房，绝不生成新密码；仅"手输名字+密码框为空+无旗标"三条件齐备才判定为新建。
 - **HTML5 校验坑**：`display:none` 的 input 带 `minlength` 会导致提交时报 "not focusable" 静默失败——隐藏密码框必须去掉 `minlength`（已改）。
@@ -373,3 +373,16 @@ localStorage.removeItem('nodecrypt-debug');     // 关（默认）
   - **频道头部显示指纹徽标**（`.pwd-fp`，8hex、可选中复制）：多端一致=同一加密频道——用于区分"同名不同密码的独立房间"（13.14 的推送串频场景肉眼可判）。
 - **语音昵称 bug（顺手修复）**：`util.voice.js` 三处（发起邀请/被叫来电提示/对方离开）只查 `.userName`，而 `userMap` 实际字段是 `.username` → 一对一通话提示显示的是 **clientId**；现按 `userName||username||name||peerId` 兜底。另修 `main.js` 选人面板昵称拼接未 `escapeHTML`（user-controlled XSS 兜底）。
 - **遗留（另行立项）**：`handleServerKey` 直接信任服务端发来的 RSA 公钥并写入 `nodecrypt_server_key`（只写不读）——服务端公钥可被 MITM 替换，削弱 E2EE 声明；建议后续做首次连接钉扎（TOFU）+ 公钥指纹显示。
+
+### 13.16 后台推送改版：通知消息 + 可见性主动离线 + 同名隔离（2026-11-11 定案）
+- **双根因回顾**：①在线设备收不到推送——`listOfflineDevices` 跳过 `record.online`，聊天页退后台 web-view 存活、WS 不断（`chat.vue` unload 才会断），设备永远"在线"，服务端根本不发；要等 `seenTimeout=60s` 清理才短暂离线。②离线/在线通道都用透传（`push_message.transmission`）——后台 JS 被 Android 冻结后无人创建本地通知，"收不到"；APP 打开才补投。
+- **在线通道 transmission → notification**（`worker/push.js buildPushBody`）：`push_message.notification = { title, body, channel_id:'nodecrypt', channel_name:'消息提醒', channel_level:4, ...vendorNotification }`——由个推 SDK/厂商系统原生弹通知栏，**后台冻结也能弹**；`click_type:'intent'` + intent 内 `S.payload=hash` 与厂商通道同构，点击路由复用既有 `extractHash`（intent payload + 正文 `[hash12]` 双保险）。字段合法性经个推官方文档核实（notification 支持 title/body/channel_id/channel_name/channel_level/click_type/intent）。`push_channel`/`options.HW` 未动。
+- **可见性主动离线（关键新机制）**：
+  - web（`NodeCrypt.js`）：`appHidden` 状态 + `setAppHidden(hidden)`（去重早退）+ `sendVisibility()`（加密控制消息 `{a:'v', p:0/1}`，守卫 `serverShared && isOpen()`）；`visibilitychange` 双向分支（visible 时顺带连通性检查）；重连/入房注册推送 token 后若仍 `appHidden` 补报 `p:0`；`destruct()` 从 `ncInstances` 注册表摘除。
+  - Android WebView 的 Page Visibility 不可靠（退后台不触发）→ APP 原生兜底：`chat.vue` 在 `onHide`/`onShow` 经 `evalJS` 调 `window.__ncSetHidden(1/0)`（`$getAppWebview().children()[0]`，文件尾定义一次、fan-out 所有实例、单实例异常不中断）。
+  - worker（`index.js`）：action `'v'` → `handleVisibility`（校验 `p` 为 0/1）→ `push.js setDeviceOnline(storage, channelHash, clientId, online)`——只改 `link === clientId` 设备记录的 `online`/`seen`，**不关 WS**；退后台即刻成为离线推送目标，不再等 seenTimeout。
+- **未读双计去重（store.js 共享标记）**：同一条消息可能同时经 WS 桥接（chat.vue 页面隐藏时 `incrementUnreadByHash`）与离线推送 receive（App.vue）到达——内存态标记 `markUnreadCounted(hash)`/`wasUnreadCountedWithin(hash, ms)`（hash 前 8 位 hex 为 key，不持久化）：receive/桥接计数前查 **5 秒**窗口；点击路径查 **5 分钟**窗口（原 `receiveCountedAt` 语义，`receiveCountedAt` 机制删除）；厂商冷启动点击无标记照常计 1。
+- **App.vue receive 不再弹本地通知**：在线通道已是通知消息，`notifyLocalPush`（`plus.push.createMessage`）会双份——方法整体删除，前台提示=未读计数+桌面角标；`activeRoomHash` 正在渲染时仍跳过计数（WS 已实时送达并标已读）。
+- **同名隔离改版（§13.14 收尾）**：路由键改为 `sha256(房间名 + '\u0000' + 密码)`（web `setCredentials` 与 APP `store.js channelHash` 同公式；`credentials.password` 仍为 `sha256(password)`，握手不变；输出仍 64 hex → `[hash12]` 长度不变）。APP 侧 `readList()` 一次性迁移（旧记录按新公式重算回写）；`addOrMergeChannel` 合并更新密码时同步重算 hash。**上线必做**：每个频道重进一次（cid 在新 hash 下重新注册）；测试阶段不留兼容层——旧 APK + 新 web 的同名房间 hash 不一致（可接受）。
+- **已知局限（按验证矩阵预期）**：厂商通知点击体无法客户端取证；无厂商通道的机型（OPPO）杀进程/冻结后仍收不到（厂商通道白名单限制）；后台 JS 挂起时首页角标可能滞后、点击通知后补计；补报机制依赖退后台前 WS 存活（已被 kill 则本来就离线，`close` 回调兜底）。
+- **验证矩阵（OPPO/WIKO + `/api/push-test?hash=<hash>&notifylog=1&push=1`）**：①首页退后台任意本地频道来消息 → 系统通知栏（需先重进频道一次完成 cid 注册）；②聊天页退后台 5 秒内来消息 → 通知栏；③点通知 → 直达频道且角标正确；④杀进程：OPPO 无（预期）、WIKO 华为横幅；⑤同一消息角标只 +1。

@@ -1,5 +1,5 @@
 import { generateClientId, encryptMessage, decryptMessage, logEvent, isString, isObject, getTime } from './utils.js';
-import { upsertDevice, markDeviceOffline, notifyOfflineDevices, readNotifyLog, removeDevice, listAllDevices, purgeDevices, debugPush, debugTaskDetail } from './push.js';
+import { upsertDevice, markDeviceOffline, setDeviceOnline, notifyOfflineDevices, readNotifyLog, removeDevice, listAllDevices, purgeDevices, debugPush, debugTaskDetail } from './push.js';
 import { getVoiceTurnIceServers } from './voiceTurn.js';
 
 export default {
@@ -399,6 +399,8 @@ export class ChatRoom {  constructor(state, env) {
         await this.handleChannelMessage(clientId, decrypted);
       } else if (action === 'dr') {
         await this.handleDeviceRegistration(clientId, decrypted);
+      } else if (action === 'v') {
+        await this.handleVisibility(clientId, decrypted);
       }
 
     } catch (error) {
@@ -444,6 +446,25 @@ export class ChatRoom {  constructor(state, env) {
       await upsertDevice(this.state.storage, this.clients[clientId].channel, pushToken, clientId, this.env);
     } catch (error) {
       logEvent('device-register', [clientId, error], 'error');
+    }
+  }
+  // Handle app visibility report (a:'v' p:0 hidden / p:1 visible): flip the online flag
+  // of the device linked to this connection without touching the WS itself, so messages
+  // sent while the app is hidden go out as native push notifications immediately.
+  // 处理 APP 可见性上报（a:'v' p:0 隐藏 / p:1 可见）：翻转本连接关联设备的 online 标记，
+  // 不动 WS 本身；隐藏期间的消息即刻走原生通知推送，无需等 seenTimeout 清理。
+  async handleVisibility(clientId, decrypted) {
+    if (decrypted.p !== 0 && decrypted.p !== 1) {
+      return;
+    }
+    const client = this.clients[clientId];
+    if (!client || !client.channel) {
+      return;
+    }
+    try {
+      await setDeviceOnline(this.state.storage, client.channel, clientId, decrypted.p ? 1 : 0);
+    } catch (error) {
+      logEvent('device-visibility', [clientId, error], 'error');
     }
   }
   // Handle client messages

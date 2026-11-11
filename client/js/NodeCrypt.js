@@ -16,6 +16,10 @@ import {
 } from 'buffer';
 window.Buffer = Buffer;
 
+// 存活实例注册表：APP 外壳经 window.__ncSetHidden 广播可见性到所有连接
+// Registry of live instances: the APP shell fans out visibility via window.__ncSetHidden
+const ncInstances = new Set();
+
 // Main NodeCrypt class for secure communication
 // 用于安全通信的 NodeCrypt 主类
 class NodeCrypt {
@@ -66,6 +70,10 @@ class NodeCrypt {
 		// 每个尚未完成握手的 peer 的延时检查器（8s 后仍未 secured → onClientPending）
 		// Deferred checkers for peers that never finish the handshake (8s → onClientPending)
 		this.pendingPeerTimers = {};
+		// APP/页面可见性（隐藏时服务器立即把本设备转为离线推送目标）
+		// App/page visibility (hidden → the server immediately treats this device as offline-push)
+		this.appHidden = false;
+		ncInstances.add(this);
 		this.setCredentials = this.setCredentials.bind(this);
 		this.connect = this.connect.bind(this);
 		this.destruct = this.destruct.bind(this);
@@ -161,8 +169,14 @@ class NodeCrypt {
 		this.logEvent('setCredentials');
 		try {
 			this.credentials = {
+				// 服务器频道/推送桶 = sha256(房间名 + NUL + 密码)：同名+不同密码的房间
+				// 彻底隔离（WS 频道、设备注册、离线推送互不串扰，修复 §13.14 同名串频）。
+				// 密码不单独上送；hash 仍是 64 位 hex，正文 [hash12] 标记长度不变。
+				// Server channel/push bucket = sha256(roomName + NUL + password): same-name
+				// rooms with different passwords are now fully isolated (WS channel, device
+				// registry, offline push). Output stays 64-hex so [hash12] keeps its length.
 				username: username,
-				channel: sha256(channel),
+				channel: sha256(String(channel) + '\u0000' + String(password || '')),
 				password: sha256(password)
 			}
 		} catch (error) {
@@ -204,6 +218,7 @@ class NodeCrypt {
 	// 清理并断开连接
 	destruct() {
 		this.logEvent('destruct');
+		ncInstances.delete(this);
 		this.stopReconnect();
 		this.stopPing();
 		this.clearPendingPeerTimers();
@@ -320,6 +335,13 @@ class NodeCrypt {
 					// 向服务器注册离线推送设备（加密通道内,服务器只知道房间哈希）
 					// Register offline push device (inside the encrypted channel, server only knows the room hash)
 					this.initPushTokenRegistration();
+					// 后台状态下（重）连上：注册会把设备标回在线，立即补报离线，
+					// 保证隐藏期间的消息仍走原生通知。
+					// (Re)connected while hidden: registration marks the device online again,
+					// so report offline at once to keep hidden-period messages as native pushes.
+					if (this.appHidden) {
+						this.sendVisibility();
+					}
 					if (this.callbacks.onServerSecured) {
 						try {
 							this.callbacks.onServerSecured()
@@ -623,6 +645,39 @@ class NodeCrypt {
 		}
 	}
 
+	// APP/页面可见性变化时向服务器上报（加密控制消息 a:'v'）：隐藏 → 本设备即刻转为
+	// 离线推送目标（服务器不关 WS），下一条消息走通知消息由系统原生弹出，不再依赖
+	// 后台 JS。恢复可见时补报在线。由 visibilitychange 或 APP 外壳 evalJS 调用。
+	// Report app/page visibility to the server (encrypted control a:'v'): hidden → this
+	// device becomes an offline-push target immediately (WS stays open), so later messages
+	// arrive as native notifications without background JS. Visible → report back online.
+	// Called from visibilitychange or via the APP shell's evalJS hook.
+	setAppHidden(hidden) {
+		const nowHidden = Boolean(hidden);
+		if (this.appHidden === nowHidden) {
+			return;
+		}
+		this.appHidden = nowHidden;
+		this.sendVisibility();
+	}
+
+	// 发送可见性控制消息（仅在服务器安全通道就绪时）
+	// Send the visibility control message (only when the secure channel is ready)
+	sendVisibility() {
+		if (!this.serverShared || !this.isOpen()) {
+			return;
+		}
+		try {
+			this.sendMessage(this.encryptServerMessage({
+				a: 'v',
+				p: this.appHidden ? 0 : 1
+			}, this.serverShared));
+			this.logEvent('visibility-report', this.appHidden ? 'hidden' : 'visible');
+		} catch (error) {
+			this.logEvent('visibility-report', error, 'error');
+		}
+	}
+
 	// 前台恢复/网络恢复时的连通性检查：socket 不通立即重连；连通但长时间无 pong
 	// 先发一次探测 ping，3s 内无回包则强制重连（失败连接借用了挂起的 TCP 缓冲/被
 	// 冻结的 webview 都会在这一步被识别）。
@@ -677,7 +732,14 @@ class NodeCrypt {
 		};
 		document.addEventListener('visibilitychange', () => {
 			if (document.visibilityState === 'visible') {
+				// 恢复可见：先补报在线（设备转回 WS 送达），再执行连通性检查
+				// Visible again: report online first (back to WS delivery), then run checks
+				this.setAppHidden(false);
 				refresh('visibility-change')
+			} else {
+				// 退到后台：立即上报离线，让服务器把后续消息转为原生通知推送
+				// Going background: report offline so later messages are pushed natively
+				this.setAppHidden(true);
 			}
 		});
 		window.addEventListener('focus', () => refresh('focus'));
@@ -910,4 +972,20 @@ class NodeCrypt {
 
 if (typeof window !== 'undefined') {
 	window.NodeCrypt = NodeCrypt
+	// APP 外壳兜底入口：Android WebView 的 Page Visibility 在退后台时不可靠，
+	// chat.vue 在页面 onHide/onShow 用 evalJS 调用本钩子广播到所有连接实例。
+	// APP shell fallback: Page Visibility is unreliable for backgrounding in Android
+	// WebView; chat.vue calls this hook via evalJS on page hide/show for every instance.
+	if (!window.__ncSetHidden) {
+		window.__ncSetHidden = function(hidden) {
+			for (const inst of ncInstances) {
+				try {
+					inst.setAppHidden(Boolean(hidden));
+				} catch (error) {
+					// 单实例失败不影响其余实例（继续广播）
+					// One failing instance must not stop the fan-out
+				}
+			}
+		};
+	}
 }
