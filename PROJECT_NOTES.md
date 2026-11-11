@@ -394,3 +394,27 @@ localStorage.removeItem('nodecrypt-debug');     // 关（默认）
 - **切换镜像（GitHub 慢时）**：只改 `appVersion.js` 的 `url` 为 `https://ai.aiui.de5.net/app/Channel-X.Y.Z.apk` 再部署，APP 不用重打包；刷新镜像文件：删 `dist/app` 重跑 `npm run build`。
 - **发版清单**：①改 `uniapp/manifest.json` versionCode(+1)/versionName → ②HBuilderX 云打包（自有证书、包名不变）→ ③GitHub Releases 建 tag 传 APK → ④改 `worker/appVersion.js`（code/name/url/note/force/mirror.source）→ ⑤`git push`（CI 部署 worker+镜像）→ ⑥验证 `/api/app-version`。
 - **首次启用**：线上旧包没有更新代码，需手动安装本版（1.1.3/113）一次；此后版本全自动。测试：`appVersion.js` 指向更高 code 的测试包（如 114）→ 旧版启动应弹窗下载安装重启；另测跳过此版本、force、404 兜底、无网络。注意基座运行 `getProperty` 返回固定值，**必须真机云打包验证**。
+
+### 14.1 更新场景操作手册（下次只改某一端时照此执行）
+- **通用前提**：一切部署经 `git push origin main`（CI 约 1.5–9 分钟，§13.8；**部署期 DO 内存重置**——测试前退出重进/强刷）。版本规则 `versionName X.Y.Z ↔ versionCode XYZ` 永不变。临时绕过 CI 可本机 `npm run build && npm run deploy`（§4.1，注意本地拉不到 GitHub 时镜像会缺，客户端 url 自动回退 GitHub 直链）。
+- **场景 A：只更新 APP（APK，改了 `uniapp/`）**
+  1. `uniapp/manifest.json`：versionName→1.1.4、versionCode→114（**严格 +1**）；
+  2. HBuilderX 云打包（同一证书、包名 `uni.app.UNI8357253` 不变）→ 得到 APK，命名 `Channel-1.1.4.apk`（英文，勿空格/中文）；
+  3. GitHub → Releases → Draft a new release：tag `app-v1.1.4`，上传该 APK；
+  4. 改 `worker/appVersion.js`：`versionCode:114`、`versionName:'1.1.4'`，`url`/`mirror.source` 的 tag 与文件名同步改，`note` 写更新说明（弹窗正文），`force` 按需；
+  5. `git push` → 验证 `https://ai.aiui.de5.net/api/app-version` 已返回 114；
+  6. 用户侧自动：旧版冷启动 3s 弹窗 → 进度下载 → 系统安装 → 重启；也可长按频道"检查更新"。验证：弹窗/进度/重启；"跳过此版本"后自动检查不再弹、手动检查仍弹；`force:true` 时无"跳过"。
+  - 注意：`uniapp/` 不入 git（APP 代码只在本地工程）；**忘改第 4 步 = 服务器不知道有新包，用户永远收不到提示**。纯 UI/逻辑小修也走本流程（无 wgt 热更，APK 整包是唯一通道）。"只更新 APP"仍伴随一次 worker 部署（appVersion.js 登记），但不改任何 worker 逻辑。
+- **场景 B：只更新服务端（改了 `worker/`）**
+  1. 改 `worker/*.js`（WS/推送/版本接口等），**不动 `appVersion.js`**（纯修复不该触发 APP 更新提示）；
+  2. `git push` 即完成（CI 每次都会跑 `vite build && fetch-apk.mjs`：`mirror.source` 指向的 Release 存在就重新生成 `dist/app` 镜像，不存在只告警）；
+  3. 验证对应接口（如 `/api/push-test?hash=...&notifylog=1`、`/api/app-version`）；
+  4. APP 无需打包升级（除非接口协议变化需两端同改→场景 D）；web 用户强刷浏览器即用新版。
+- **场景 C：只更新网页客户端（改了 `client/`）**
+  1. 改 `client/**`（页面/样式/NodeCrypt.js 等）；
+  2. `git push` → CI `vite build` 出新静态资源（`/assets/*` 带 hash 长效缓存；`index.html` no-cache 保证入口新鲜，无需手动清缓存）；
+  3. web 用户强刷生效；**APP 内嵌页面也走服务器 JS**——下次打开聊天页即加载新版（个别顽固缓存重启 APP 或清 WebView 缓存）；
+  4. APP 壳无需动、无需打包。**红线**：改动若涉及两端一致性协议（hash 公式 `sha256(房间名+NUL+密码)`、加密/握手格式、消息 action、控制消息），必须 APP 同步改并走场景 D，否则两端不一致 → 互不可见/功能失效（§13.14 教训）。
+- **场景 D：三端联动（协议级/大版本）**
+  顺序 = 先代码后登记：改 client/worker/uniapp → `git push`（worker+web 先上线）→ 云打包新 APK → Release 上传 → 改 `appVersion.js` → **再 push 一次**（版本登记上线，镜像随之生成）→ 旧版 APP 自动升级。
+- **对账排查清单**：①`/api/app-version` 返回的 code/url 是否预期；②镜像 `https://ai.aiui.de5.net/app/Channel-X.Y.Z.apk` 是否 200（缺=CI 没拉到 Release）；③GitHub Release 资产文件名与 `appVersion.url` **逐字符一致**（404 常见根因）；④用户没收到提示 → 查 versionCode 是否真 +1、手机是否点了"跳过此版本"（长按手动检查可绕过）；⑤下载/安装失败 → `update.js` 弹窗自带"浏览器下载"兜底。
