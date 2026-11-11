@@ -4,7 +4,7 @@
   "description": "端到端加密系统",
   "main": "worker/index.js",
   "scripts": {
-    "build": "vite build",
+    "build": "vite build && node scripts/fetch-apk.mjs",
     "dev": " wrangler dev",
     "deploy": " wrangler deploy",
     "publish": " wrangler publish",

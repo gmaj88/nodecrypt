@@ -383,3 +383,14 @@ localStorage.removeItem('nodecrypt-debug');     // 关（默认）
 - **保留项（唯一存活改动）**：频道/推送桶 hash = `sha256(房间名 + NUL + 密码)`（web `setCredentials` + APP `store.js channelHash`/`readList` 迁移/`addOrMergeChannel` 重算），同名不同密码彻底隔离（§13.14）。推送链路恢复透传+客户端本地通知（`notifyLocalPush`+`receiveCountedAt`）原逻辑。
 - **教训**：①改推送形态前先确认它会触发哪条 uni-app 回调（receive/click/launch）——通知消息不触发 receive，角标链路直接断；②测试机只覆盖 OPPO（无厂商通道）时，"改通知消息"类方案无验证途径；③一次性上多组改动（推送形态+可见性+去重+hash）出问题时无法归因，回退也只能整体回。
 - **若重启后台推送课题**：前置条件是 OPPO 配置厂商通道（可信），且方案必须保证 receive 触发（或补一条客户端计数路径）；可见性上报/通知消息代码可从本节 git 历史找回。
+
+## 14. APP 自动更新（Android 整包，GitHub Releases + Worker 镜像，2026-11-11 定案）
+- **版本规则**：`versionName X.Y.Z ↔ versionCode XYZ`（小数点拼数字，1.1.3 → 113）——每次打包 versionCode **严格 +1**（忘加则不提示更新或覆盖安装失败）；证书/包名（`uni.app.UNI8357253`）不变，否则只能卸载重装（丢本地频道列表）。
+- **版本源（唯一登记处）**：`worker/appVersion.js` → `GET /api/app-version`（白名单返回 versionCode/versionName/url/size/sha256/note/force，`Cache-Control: no-store`，须在通用 `/api/` stub 之前）。`mirror` 字段仅构建用不返回。
+- **APP 端**：`uniapp/utils/update.js`（`checkAppUpdate({silent})`/`getLocalVersion`）——仅 Android；`uni.request` 8s 超时拉版本 → `remote.versionCode > local` 才继续 → `uni.showModal`（`立即更新`/`跳过此版本`，`force` 无跳过）→ `plus.downloader`（进度 `plus.nativeUI.showWaiting`，filename `_downloads/Channel-<code>.apk`，timeout 600s）→ `plus.runtime.install({force:false})` → 成功 `plus.runtime.restart()`；下载/安装失败均弹"浏览器下载"兜底（`plus.runtime.openURL(url)`，应对 OPPO 等拦截）。"跳过此版本"存 `@nodecrypt/skipVersion`（存 versionCode）；**手动检查忽略跳过标记**。
+- **检查时机**：App.vue `onLaunch` 延后 3s（避开首屏/预热/推送注册）；通知点击冷启动（30s 内 `pushRouteAt`）跳过本次。重入保护 `checking`。首页长按频道菜单有 `检查更新（vX.Y.Z）`（`index.vue onChannelLongPress`）。
+- **权限**：manifest.json `REQUEST_INSTALL_PACKAGES`（Android 8+ 首次安装需用户允许"安装未知应用"）。
+- **APK 托管**：主托管 GitHub Releases（tag `app-vX.Y.Z`，资源 `Channel-X.Y.Z.apk`，仓库公开可匿名下载，plus.downloader 支持 302）；**Worker 镜像**：`scripts/fetch-apk.mjs`（`npm run build` 尾部执行）从 `mirror.source` 下载到 `dist/app/`，随 Worker 静态资源部署，`_headers` 对 `/app/*` 永久缓存；**单文件上限 25MiB**（当前 APK 23MB，超限需换 R2/VPS）。镜像失败仅告警不阻断（客户端 url 回退 GitHub）。
+- **切换镜像（GitHub 慢时）**：只改 `appVersion.js` 的 `url` 为 `https://ai.aiui.de5.net/app/Channel-X.Y.Z.apk` 再部署，APP 不用重打包；刷新镜像文件：删 `dist/app` 重跑 `npm run build`。
+- **发版清单**：①改 `uniapp/manifest.json` versionCode(+1)/versionName → ②HBuilderX 云打包（自有证书、包名不变）→ ③GitHub Releases 建 tag 传 APK → ④改 `worker/appVersion.js`（code/name/url/note/force/mirror.source）→ ⑤`git push`（CI 部署 worker+镜像）→ ⑥验证 `/api/app-version`。
+- **首次启用**：线上旧包没有更新代码，需手动安装本版（1.1.3/113）一次；此后版本全自动。测试：`appVersion.js` 指向更高 code 的测试包（如 114）→ 旧版启动应弹窗下载安装重启；另测跳过此版本、force、404 兜底、无网络。注意基座运行 `getProperty` 返回固定值，**必须真机云打包验证**。

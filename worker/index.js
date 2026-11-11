@@ -1,6 +1,7 @@
 import { generateClientId, encryptMessage, decryptMessage, logEvent, isString, isObject, getTime } from './utils.js';
 import { upsertDevice, markDeviceOffline, notifyOfflineDevices, readNotifyLog, removeDevice, listAllDevices, purgeDevices, debugPush, debugTaskDetail } from './push.js';
 import { getVoiceTurnIceServers } from './voiceTurn.js';
+import { APP_VERSION } from './appVersion.js';
 
 export default {
   async fetch(request, env, ctx) {
@@ -29,6 +30,24 @@ export default {
       const id = env.CHAT_ROOM.idFromName('chat-room');
       const stub = env.CHAT_ROOM.get(id);
       return stub.fetch(request);
+    }
+
+    // APP 自动更新版本检查：返回最新 APK 版本信息（mirror 为构建用内部字段，不返回）
+    // APP auto-update check: latest APK version info (the internal build-only mirror field is excluded)
+    // 必须放在通用 /api/ stub 之前；no-store 防止任何缓存层滞留旧版本
+    // Must sit before the generic /api/ stub; no-store keeps every cache layer off stale versions
+    if (url.pathname === '/api/app-version') {
+      return new Response(JSON.stringify({
+        versionCode: APP_VERSION.versionCode,
+        versionName: APP_VERSION.versionName,
+        url: APP_VERSION.url,
+        size: APP_VERSION.size,
+        sha256: APP_VERSION.sha256,
+        note: APP_VERSION.note,
+        force: APP_VERSION.force
+      }), {
+        headers: { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' }
+      });
     }
 
     // 处理API请求
