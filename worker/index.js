@@ -32,6 +32,14 @@ export default {
       return stub.fetch(request);
     }
 
+    // 主动离开上报：页面销毁时 WS 消息可能来不及发出，sendBeacon 走这里转发进 DO
+    // Explicit leave report: WS messages may not flush during page teardown; beacons come through here
+    if (url.pathname === '/api/leave') {
+      const id = env.CHAT_ROOM.idFromName('chat-room');
+      const stub = env.CHAT_ROOM.get(id);
+      return stub.fetch(request);
+    }
+
     // APP 自动更新版本检查：返回最新 APK 版本信息（mirror 为构建用内部字段，不返回）
     // APP auto-update check: latest APK version info (the internal build-only mirror field is excluded)
     // 必须放在通用 /api/ stub 之前；no-store 防止任何缓存层滞留旧版本
@@ -151,6 +159,25 @@ export class ChatRoom {  constructor(state, env) {
 
   async fetch(request) {
     const url = new URL(request.url);
+
+    // 主动离开端点：sendBeacon / APP 原生桥的 HTTP 兜底（WS q 之外的第二通道，幂等）
+    // Explicit leave endpoint: HTTP fallback for sendBeacon / native APP bridge (second channel
+    // alongside the WS q action, idempotent)
+    // 仅当 cid 存在且其频道与 hash 一致才执行，防止误踢他人
+    // Only acts when the cid exists and its channel matches the hash (anti-miskick guard)
+    if (url.pathname === '/api/leave') {
+      try {
+        const hash = url.searchParams.get('hash') || '';
+        const cid = url.searchParams.get('cid') || '';
+        const client = this.clients[cid];
+        if (client && hash && client.channel === hash) {
+          await this.leaveChannel(cid, true);
+        }
+        return new Response(null, { status: 204 });
+      } catch (error) {
+        return new Response(JSON.stringify({ error: String(error && error.message || error) }), { status: 500, headers: { 'Content-Type': 'application/json' } });
+      }
+    }
 
     // 推送诊断端点（临时排查用）：不带 hash 仅列出设备；?hash=x&push=1 实际下发一条推送并返回全过程
     // Push diagnostic endpoint (temporary): without hash lists devices; with ?hash=x&push=1 sends a test push
@@ -342,58 +369,65 @@ export class ChatRoom {  constructor(state, env) {
     connection.addEventListener('close', async (event) => {
       logEvent('close', [clientId, event], 'debug');
 
+      // 异常断线（没有主动离开信号）：摘除成员并广播不带 x 标记的名单
+      // → 客户端按 45s 延迟判定提示"离开"，期间同名重连则静默取消
+      // Abrupt close (no explicit-leave signal): remove and broadcast without the x
+      // marker → clients apply the 45s delayed judgment; a same-name rejoin cancels it
+      await this.leaveChannel(clientId, false);
+
       // cleanupOldConnections 可能已删除该客户端，需要防御缺失
       // cleanupOldConnections may have already deleted this client; guard against it
-      const clientInfo = this.clients[clientId];
-      const channel = clientInfo ? (clientInfo.channel || null) : null;
-
-      if (channel && this.channels[channel]) {
-        // 用 filter 摘除成员：旧实现用 indexOf+splice，若 indexOf 为 -1
-        // 会误删数组最后一个成员；且仅在确实发生变化时广播
-        // Remove via filter: the old indexOf+splice dropped the wrong member on -1;
-        // broadcast only when membership actually changed
-        const remaining = this.channels[channel].filter((id) => id !== clientId);
-        if (remaining.length !== this.channels[channel].length) {
-          this.channels[channel] = remaining;
-
-          if (remaining.length === 0) {
-            delete(this.channels[channel]);
-          } else {
-            try {
-              const members = this.channels[channel];
-
-              for (const member of members) {
-                const client = this.clients[member];              if (this.isClientInChannel(client, channel)) {
-                  this.sendMessage(client.connection, encryptMessage({
-                    a: 'l',
-                    p: members.filter((value) => {
-                      return (value !== member ? true : false);
-                    })
-                  }, client.shared));
-                }
-              }
-
-            } catch (error) {
-              logEvent('close-list', [clientId, error], 'error');
-            }
-          }
-        }
-      }
-
-      // 将该连接关联的推送设备标记为离线，使其成为离线推送的目标
-      // Mark push devices linked to this connection offline so they become offline push targets
-      if (channel) {
-        try {
-          await markDeviceOffline(this.state.storage, channel, clientId);
-        } catch (error) {
-          logEvent('close-device-offline', [clientId, error], 'error');
-        }
-      }
-
       if (this.clients[clientId]) {
         delete(this.clients[clientId]);
       }
     });
+  }
+  // 统一离开出口：摘除成员、广播名单、设备转离线。
+  // explicit=true 表示主动离开（WS q / /api/leave）：名单带 x 标记 → 其他端立即提示，并关闭连接；
+  // explicit=false 表示异常断线/清理：不带标记 → 客户端延迟判定。
+  // Unified leave path: remove member, broadcast list, mark device offline.
+  // explicit=true = intentional leave (WS q / /api/leave): list carries the x marker so
+  // peers notify instantly, and the connection is closed; explicit=false = abrupt
+  // disconnect/cleanup: no marker, clients apply the delayed judgment.
+  async leaveChannel(clientId, explicit) {
+    const clientInfo = this.clients[clientId];
+    const channel = clientInfo ? (clientInfo.channel || null) : null;
+    if (!channel) {
+      return;
+    }
+    clientInfo.channel = null;
+    if (this.channels[channel]) {
+      // 用 filter 摘除成员：旧实现用 indexOf+splice，若 indexOf 为 -1
+      // 会误删数组最后一个成员；且仅在确实发生变化时广播
+      // Remove via filter: the old indexOf+splice dropped the wrong member on -1;
+      // broadcast only when membership actually changed
+      const remaining = this.channels[channel].filter((id) => id !== clientId);
+      if (remaining.length !== this.channels[channel].length) {
+        this.channels[channel] = remaining;
+
+        if (remaining.length === 0) {
+          delete(this.channels[channel]);
+        } else {
+          this.broadcastMemberList(channel, explicit ? [clientId] : null);
+        }
+      }
+    }
+
+    // 将该连接关联的推送设备标记为离线，使其成为离线推送的目标
+    // Mark push devices linked to this connection offline so they become offline push targets
+    try {
+      await markDeviceOffline(this.state.storage, channel, clientId);
+    } catch (error) {
+      logEvent('leave-device-offline', [clientId, error], 'error');
+    }
+
+    if (explicit && clientInfo.connection) {
+      try {
+        clientInfo.connection.close();
+      } catch (error) {
+        logEvent('leave-close', [clientId, error], 'error');
+      }
+    }
   }
   // Process encrypted messages
   async processEncryptedMessage(clientId, message) {
@@ -418,6 +452,10 @@ export class ChatRoom {  constructor(state, env) {
         await this.handleChannelMessage(clientId, decrypted);
       } else if (action === 'dr') {
         await this.handleDeviceRegistration(clientId, decrypted);
+      } else if (action === 'q') {
+        // 主动辞别：立即摘除并广播（带 x 标记），其他端马上提示"离开对话"
+        // Explicit goodbye: remove and broadcast at once (x marker) so peers see "left" instantly
+        await this.leaveChannel(clientId, true);
       }
 
     } catch (error) {
@@ -546,7 +584,12 @@ export class ChatRoom {  constructor(state, env) {
     }
   }
   // Broadcast member list to channel
-  broadcastMemberList(channel) {
+  // explicitLeftIds：主动离开的成员 id（客户端据此立即提示）；i：接收者自己的 clientId
+  // （客户端此前不知道自己的 id，beacon 离线上报与"我"的判定都需要它）
+  // Broadcast member list; explicitLeftIds marks explicit leavers (clients notify instantly);
+  // i echoes the recipient's own clientId (previously unknown to clients; needed for the
+  // beacon leave report and correct self identification)
+  broadcastMemberList(channel, explicitLeftIds) {
     try {
       const members = this.channels[channel];
 
@@ -556,10 +599,14 @@ export class ChatRoom {  constructor(state, env) {
         if (this.isClientInChannel(client, channel)) {
           const messageObj = {
             a: 'l',
+            i: member,
             p: members.filter((value) => {
               return (value !== member ? true : false);
             })
           };
+          if (explicitLeftIds && explicitLeftIds.length) {
+            messageObj.x = explicitLeftIds;
+          }
 
           const encrypted = encryptMessage(messageObj, client.shared);
           this.sendMessage(client.connection, encrypted);

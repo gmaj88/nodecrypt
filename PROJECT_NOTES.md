@@ -418,3 +418,14 @@ localStorage.removeItem('nodecrypt-debug');     // 关（默认）
 - **场景 D：三端联动（协议级/大版本）**
   顺序 = 先代码后登记：改 client/worker/uniapp → `git push`（worker+web 先上线）→ 云打包新 APK → Release 上传 → 改 `appVersion.js` → **再 push 一次**（版本登记上线，镜像随之生成）→ 旧版 APP 自动升级。
 - **对账排查清单**：①`/api/app-version` 返回的 code/url 是否预期；②镜像 `https://ai.aiui.de5.net/app/Channel-X.Y.Z.apk` 是否 200（缺=CI 没拉到 Release）；③GitHub Release 资产文件名与 `appVersion.url` **逐字符一致**（404 常见根因）；④用户没收到提示 → 查 versionCode 是否真 +1、手机是否点了"跳过此版本"（长按手动检查可绕过）；⑤下载/安装失败 → `update.js` 弹窗自带"浏览器下载"兜底。
+
+## 15. 在线状态与"加入/离开对话"提示（2026-11-11 定案并实施）
+- **语义**：服务端不再把"WS 断开/60s 心跳超时"直接当"离开"。只有**主动离开信号**才立即广播；无信号的断线交给客户端 **45s 延迟判定**（`room.js LEAVE_CONFIRM_MS`）——到期时同名成员已在房间（断线重连）则静默取消，否则才显示"离开对话"。
+- **主动离开信号（立即提示"离开"）**：① WS 消息 `{a:'q'}`（`leavePresence()` 发出，服务端 `q` 分支 → `leaveChannel(cid,true)`）；② HTTP `GET/POST /api/leave?hash=<hash>&cid=<cid>`（sendBeacon 兜底，页面销毁时 WS 可能来不及发；**hash 必须与该 cid 的频道一致**才执行，幂等 204）。触发源：关标签/刷新（`pagehide`）、退出房间按钮（`exitRoom` 先 leavePresence 再 destruct）、APP 切后台/返回首页（`App.vue onShow/onHide` → `uni.$emit('nodecrypt-app-hide/show')` → `chat.vue` evalJS 调网页端 `window.__ncPresenceLeave/__ncPresenceResume`）。
+- **"加入对话"**：握手完成即提示（现状不变）；若存在同名挂起的延迟离开 → 取消挂起并**静默恢复**（不提示加入）。主动离开后重进频道会正常提示"加入"。
+- **协议变更（`l` 名单消息）**：`{a:'l', i:<接收者clientId>, p:[其余成员], x:[主动离开的id]}`。`i` 修复了客户端 `rd.myId` 恒为 undefined 的旧问题；`x` 仅主动离开时携带；异常断线/60s 清理的广播不带 `x`。加字段向后兼容（旧页面忽略）。
+- **防假事件配套**：`armLifecycleWatchdog` 恢复可见时**一律先探测**（发 ping，3s 无 pong 才 forceReconnect）——此前"超 25s 无 pong 直接强断"即使连接还活着也会制造"离开+加入"；`paused` 标志期间 `onClose/onError` 不自动重连，`resumePresence()` 恢复；bfcache `pageshow(persisted)` 恢复在线。
+- **握手未完成提示已移除**：`room.js handleClientPending` 改为空操作（hash 含密码后同频道不可能密码不一致，该提示只剩弱网/后台节流误报）；`pendingHandshakeTimeout` 8s→20s（NodeCrypt 两处 config），仅调试日志可见（`nodecrypt-debug=1`）。
+- **已知限制**：①强制杀 APP/系统清理：进程直接消失无法发信号 → 约 45s 后延迟提示；②浏览器刷新 = 真操作 → 立即"离开+加入"；③浏览器切标签/最小化（不关闭）= 延迟判定（可 45s+心跳超时 60s ≈ 105s 后提示）；④`/api/leave` 仅凭 hash+cid 鉴别（hash 由密码派生，仅房内成员可知），测试期可接受。
+- **测试清单**：两端静置无任何提示；APP 切后台/返回首页→对端立即"离开"、回前台→"加入"；关标签→立即"离开"；切标签 1 分钟内回来→无提示；飞行模式 10s 恢复→无提示无重复成员；杀 APP→约 45s 后"离开"；退出房间按钮→立即"离开"。
+- **推送/角标不受影响**：`leaveChannel`（含 q 与 close 路径）仍调用 `markDeviceOffline`；cleanup 逻辑未动；APP 未读计数/桥接（`nodecrypt-msg`、`syncActiveRoomHash`、`maybeMarkRead`）未改。

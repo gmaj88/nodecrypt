@@ -33,7 +33,7 @@ class NodeCrypt {
 			// waited for the OS TCP timeout, ~1 minute)
 			pingInterval: config.pingInterval || 10000,
 			pongTimeout: config.pongTimeout || 25000,
-			pendingHandshakeTimeout: config.pendingHandshakeTimeout || 8000,
+			pendingHandshakeTimeout: config.pendingHandshakeTimeout || 20000,
 			debug: config.debug || false,
 		};
 		this.callbacks = {
@@ -63,6 +63,10 @@ class NodeCrypt {
 		this.lastPingSentAt = 0;
 		this.probeTimer = null;
 		this.connectStartedAt = 0;
+		// 服务端名单回传的本端 clientId（l.i）；主动离开暂停标志
+		// Our own clientId echoed by the server (l.i); explicit-leave pause flag
+		this.selfId = null;
+		this.paused = false;
 		// 每个尚未完成握手的 peer 的延时检查器（8s 后仍未 secured → onClientPending）
 		// Deferred checkers for peers that never finish the handshake (8s → onClientPending)
 		this.pendingPeerTimers = {};
@@ -221,7 +225,7 @@ class NodeCrypt {
 			reconnectDelay: 3000,
 			pingInterval: 10000,
 			pongTimeout: 25000,
-			pendingHandshakeTimeout: 8000,
+			pendingHandshakeTimeout: 20000,
 			debug: false,
 		};
 		this.callbacks.onServerClosed = null;
@@ -345,6 +349,12 @@ class NodeCrypt {
 			return
 		}
 		if (serverDecrypted.a === 'l' && this.isArray(serverDecrypted.p)) {
+			// 服务端在名单中带回本端 clientId（i）与主动离开标记（x）
+			// Server echoes our own clientId (i) and explicit-leave markers (x) in the list
+			if (this.isString(serverDecrypted.i)) {
+				this.selfId = serverDecrypted.i;
+			}
+			const explicitLeftIds = this.isArray(serverDecrypted.x) ? serverDecrypted.x.filter((value) => this.isString(value)) : null;
 			let logListResend = 0;
 			try {
 				for (const clientId in this.channel) {
@@ -405,7 +415,7 @@ class NodeCrypt {
 					}
 				}
 				try {
-					this.callbacks.onClientList(clients)
+					this.callbacks.onClientList(clients, this.selfId, explicitLeftIds)
 				} catch (error) {
 					this.logEvent('onMessage-client-list-callback', error, 'error')
 				}
@@ -520,7 +530,7 @@ class NodeCrypt {
 	async onError(event) {
 		this.logEvent('onError', event, 'error');
 		this.disconnect();
-		if (this.credentials) {
+		if (this.credentials && !this.paused) {
 			this.startReconnect()
 		}
 		if (this.callbacks.onServerClosed) {
@@ -536,6 +546,11 @@ class NodeCrypt {
 	// WebSocket 关闭事件处理
 	async onClose(event) {
 		this.logEvent('onClose', event);
+		// 主动离开期间（paused）不自动重连，等待 resumePresence
+		// No auto-reconnect while intentionally away (paused); wait for resumePresence
+		if (this.paused) {
+			return
+		}
 		this.disconnect();
 		if (this.credentials) {
 			this.startReconnect()
@@ -644,6 +659,12 @@ class NodeCrypt {
 				return
 			}
 			this.logEvent('lifecycle', why);
+			if (this.paused) {
+				// 主动离开中（APP 后台/退出房间/页面卸载）：回到可见状态即恢复在线
+				// While intentionally away (APP background / room exit / page unload): visibility resumes presence
+				this.resumePresence();
+				return
+			}
 			if (!this.connection) {
 				this.connect();
 				return
@@ -662,10 +683,11 @@ class NodeCrypt {
 				return
 			}
 			const now = Date.now();
-			if (this.lastPongAt && now - this.lastPongAt > this.config.pongTimeout) {
-				this.forceReconnect(why + ': stale (no pong ' + (now - this.lastPongAt) + 'ms)');
-				return
-			}
+			// 恢复时一律先探测：连接多半还活着，直接强断会在对方端制造"离开/加入"假事件；
+			// 3 秒内没有 pong 才真正重连（僵尸 TCP/半开连接场景）
+			// Always probe on resume: the socket is usually still alive; force-closing it creates
+			// phantom left/joined events on the other side. Reconnect only if no pong in 3s
+			// (zombie TCP / half-open socket).
 			if (now - (this.lastPongAt || 0) > this.config.pingInterval) {
 				this.lastPingSentAt = now;
 				this.sendMessage('ping');
@@ -675,7 +697,7 @@ class NodeCrypt {
 				this.probeTimer = setTimeout(() => {
 					this.probeTimer = null;
 					const stale = this.lastPongAt && (Date.now() - this.lastPongAt) > this.config.pongTimeout;
-					if (this.credentials && stale && this.isOpen()) {
+					if (this.credentials && !this.paused && stale && this.isOpen()) {
 						this.forceReconnect('lifecycle-probe')
 					}
 				}, 3000)
@@ -687,7 +709,28 @@ class NodeCrypt {
 			}
 		});
 		window.addEventListener('focus', () => refresh('focus'));
-		window.addEventListener('online', () => refresh('online'));
+		window.addEventListener('online', () => {
+			// 主动离开期间网络恢复不上线（否则 APP 在后台会被错误拉回"在线"）
+			// Don't come back online while intentionally away (a backgrounded APP would
+			// otherwise reconnect and appear online against the explicit leave)
+			if (!this.paused) {
+				refresh('online');
+			}
+		});
+		// 关标签/页面卸载：尽力发出主动离开（WS q + sendBeacon 兜底）
+		// Tab close / page unload: best-effort explicit leave (WS q + sendBeacon fallback)
+		window.addEventListener('pagehide', () => {
+			if (this.credentials) {
+				this.leavePresence('pagehide');
+			}
+		});
+		// bfcache 恢复（前进/后退缓存复用页面）时需要恢复在线
+		// bfcache restore reuses the page; presence must resume
+		window.addEventListener('pageshow', (event) => {
+			if (this.credentials && event && event.persisted) {
+				this.resumePresence();
+			}
+		});
 	}
 
 	// 清理所有未握手 peer 的延时检查器
@@ -699,11 +742,11 @@ class NodeCrypt {
 		this.pendingPeerTimers = {}
 	}
 
-	// 某 peer 的 username 尚未到达时挂一个 8s 检查：到点仍未 secured → onClientPending。
-	// 这把"密码不一致/链路丢包导致的静默隐身"变成可见的系统提示。
-	// Schedule an 8s check when a peer has no username yet; if still unsecured →
-	// onClientPending. Turns silent invisibility (password mismatch / lost handshake)
-	// into a visible system notice.
+	// 某 peer 的 username 尚未到达时挂一个 20s 检查：到点仍未 secured → onClientPending。
+	//（此前 8s 误报率高：弱网/后台节流下握手消息常迟到；由 room.js 决定是否展示）
+	// Schedule a 20s check when a peer has no username yet; if still unsecured →
+	// onClientPending. (Raised from 8s: on weak networks / throttled background pages
+	// handshake messages often arrive late; room.js decides whether to show anything.)
 	armPendingPeerCheck(peerId) {
 		if (this.pendingPeerTimers[peerId]) {
 			return
@@ -752,6 +795,69 @@ class NodeCrypt {
 			} catch (error) {
 				this.logEvent('disconnect', error, 'error')
 			}
+		}
+	}
+
+	// 主动离开：让服务端立即摘除本端（其他成员马上看到"离开对话"），并暂停自动重连。
+	// 触发源：APP 切后台/返回首页（uni 桥 evalJS）、浏览器 pagehide（关标签）、退出房间按钮。
+	// Explicit leave: the server drops us at once (others see "left" instantly) and auto-reconnect
+	// is paused. Sources: APP background/home (uni bridge evalJS), browser pagehide (tab close),
+	// and the exit-room button.
+	leavePresence(reason) {
+		if (this.paused) {
+			return
+		}
+		this.paused = true;
+		this.logEvent('leavePresence', reason || '');
+		this.stopPing();
+		this.stopReconnect();
+		try {
+			if (this.isOpen() && this.serverShared) {
+				// q = 主动辞别：服务端摘除成员并广播（带 x 标记），随后会关闭本连接
+				// q = explicit goodbye: the server removes us and broadcasts (x marker), then closes
+				this.sendMessage(this.encryptServerMessage({ a: 'q' }, this.serverShared));
+			}
+		} catch (error) {
+			this.logEvent('leavePresence', error, 'error');
+		}
+		try {
+			// sendBeacon 兜底：页面销毁时 WS 消息可能来不及发出；/api/leave 幂等
+			// sendBeacon fallback: the WS message may not flush during page teardown; /api/leave is idempotent
+			if (typeof navigator !== 'undefined' && typeof navigator.sendBeacon === 'function' &&
+				this.credentials && this.credentials.channel && this.selfId) {
+				const beaconUrl = window.location.origin + '/api/leave?hash=' + encodeURIComponent(this.credentials.channel) +
+					'&cid=' + encodeURIComponent(this.selfId);
+				navigator.sendBeacon(beaconUrl, new Blob([]));
+			}
+		} catch (error) {
+			this.logEvent('leavePresence-beacon', error, 'error');
+		}
+		try {
+			// 主动关闭本地连接：确保 resumePresence 一定走全新连接重新进房
+			// （排队的 q 会先于关闭帧发出；即便丢失也有 sendBeacon 兜底）
+			// Close the local socket so resumePresence always reconnects fresh (full handshake +
+			// rejoin). Queued messages flush before the close frame; even if lost, the beacon covers it.
+			if (!this.isClosed()) {
+				this.connection.close();
+			}
+		} catch (error) {
+			this.logEvent('leavePresence-close', error, 'error');
+		}
+	}
+
+	// 恢复在线：清除 paused 并立即重连（APP 回前台 / 页面重新可见 / bfcache 恢复）
+	// Resume presence: clear paused and reconnect right away (app foreground / page visible / bfcache)
+	resumePresence() {
+		if (!this.paused) {
+			return
+		}
+		this.paused = false;
+		this.logEvent('resumePresence');
+		// 仅在连接已关闭时重连（CONNECTING 中重复 connect 会造成双连接抖动）
+		// Reconnect only when fully closed (a second connect() while CONNECTING causes churn)
+		if (this.isClosed() && this.credentials) {
+			this.stopReconnect();
+			this.connect();
 		}
 	}
 

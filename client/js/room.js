@@ -158,7 +158,7 @@ export function joinRoom(userName, roomName, password, modal = null, onResult) {
 		},
 		onClientSecured: (user) => handleClientSecured(idx, user),
 		onClientPending: (info) => handleClientPending(idx, info),
-		onClientList: (list, selfId) => handleClientList(idx, list, selfId),
+		onClientList: (list, selfId, explicitLeft) => handleClientList(idx, list, selfId, explicitLeft),
 		onClientLeft: (clientId) => handleClientLeft(idx, clientId),
 		onClientMessage: (msg) => handleClientMessage(idx, msg)
 	};
@@ -169,15 +169,19 @@ export function joinRoom(userName, roomName, password, modal = null, onResult) {
 }
 
 // Handle the client list update
-// 处理客户端列表更新
-export function handleClientList(idx, list, selfId) {
+// selfId：服务端回传的本端 clientId（修复此前 myId 恒为 undefined）；
+// explicitLeft：主动离开的成员 id 列表（这些离开立即提示，其余延迟判定）
+// Handle the client list update. selfId: our own clientId echoed by the server (fixes
+// myId always being undefined); explicitLeft: ids that left explicitly (instant notice,
+// the rest go through the delayed judgment)
+export function handleClientList(idx, list, selfId, explicitLeft) {
 	const rd = roomsData[idx];
 	if (!rd) return;
 	const oldUserIds = new Set((rd.userList || []).map(u => u.clientId));
 	const newUserIds = new Set(list.map(u => u.clientId));
 	for (const oldId of oldUserIds) {
 		if (!newUserIds.has(oldId)) {
-			handleClientLeft(idx, oldId)
+			handleClientLeft(idx, oldId, Array.isArray(explicitLeft) && explicitLeft.indexOf(oldId) >= 0)
 		}
 	}
 	rd.userList = list;
@@ -185,7 +189,7 @@ export function handleClientList(idx, list, selfId) {
 	list.forEach(u => {
 		rd.userMap[u.clientId] = u
 	});
-	rd.myId = selfId;
+	if (selfId) rd.myId = selfId;
 	if (activeRoomIndex === idx) {
 		renderUserList(false);
 		renderMainHeader()
@@ -202,9 +206,6 @@ export function handleClientList(idx, list, selfId) {
 export function handleClientSecured(idx, user) {
 	const rd = roomsData[idx];
 	if (!rd) return;
-	if (rd.pendingShown) {
-		delete rd.pendingShown[user.clientId]
-	}
 	rd.userMap[user.clientId] = user;
 	const existingUserIndex = rd.userList.findIndex(u => u.clientId === user.clientId);
 	if (existingUserIndex === -1) {
@@ -222,48 +223,62 @@ export function handleClientSecured(idx, user) {
 	if (!rd.isInitialized) {
 		return
 	}
+	const name = user.userName || user.username || user.name || t('ui.anonymous', 'Anonymous');
+	// 延迟判定中的同名离开：取消挂起并静默恢复（不提示"加入"，避免断线重连的噪音）。
+	// 主动离开（已立即提示过"离开"）不产生挂起项，重进会正常提示"加入"。
+	// A held leave for the same name: cancel it and resume silently (no join notice).
+	// Explicit leaves (already announced instantly) leave no hold, so rejoining shows normally.
+	rd.pendingLeaves = rd.pendingLeaves || {};
+	let resumed = false;
+	for (const pendingId of Object.keys(rd.pendingLeaves)) {
+		if (rd.pendingLeaves[pendingId].name === name) {
+			clearTimeout(rd.pendingLeaves[pendingId].timer);
+			delete rd.pendingLeaves[pendingId];
+			resumed = true;
+		}
+	}
 	const isNew = !rd.knownUserIds.has(user.clientId);
 	if (isNew) {
-		rd.knownUserIds.add(user.clientId);		const name = user.userName || user.username || user.name || t('ui.anonymous', 'Anonymous');
-		const msg = `${name} ${t('system.joined', 'joined the conversation')}`;
-		rd.messages.push({
-			type: 'system',
-			text: msg
-		});
-		if (activeRoomIndex === idx) addSystemMsg(msg, true);
-		if (window.notifyMessage) {
-			window.notifyMessage(rd.roomName, 'system', msg)
+		rd.knownUserIds.add(user.clientId);
+		if (!resumed) {
+			const msg = `${name} ${t('system.joined', 'joined the conversation')}`;
+			rd.messages.push({
+				type: 'system',
+				text: msg
+			});
+			if (activeRoomIndex === idx) addSystemMsg(msg, true);
+			if (window.notifyMessage) {
+				window.notifyMessage(rd.roomName, 'system', msg)
+			}
 		}
 	}
 }
 
-// Handle a member that never completes the E2E handshake (8s after appearing in
-// the member list): almost certainly a password mismatch, e.g. someone typed the
-// room name manually instead of joining via the share link — make it visible
-// instead of silently rendering both sides invisible
-// 处理 8 秒后仍未完成加密握手的成员：几乎一定是密码不一致
-// （如手动输入房间名而非通过分享链接加入），把静默隐身变成可见提示
+// Handle a member that never completes the E2E handshake (8s→20s after appearing in
+// the member list). No longer rendered: since hashes derive from the password, a
+// password mismatch cannot share a channel, so this was almost always a weak-network /
+// throttled-page false alarm. NodeCrypt logs it and the member-list rebroadcast retries
+// the handshake automatically.
+// 某成员握手未完成：不再在聊天区显示提示（hash 含密码后同频道不可能密码不一致，
+// 该提示基本只剩弱网/后台节流误报）。NodeCrypt 侧仍有日志，名单重播会自动重试握手。
 export function handleClientPending(idx, info) {
-	const rd = roomsData[idx];
-	if (!rd || !info || !info.clientId) return;
-	rd.pendingShown = rd.pendingShown || {};
-	if (rd.pendingShown[info.clientId]) return;
-	rd.pendingShown[info.clientId] = true;
-	const msg = t('system.pending_handshake', '[Notice] A member failed to complete the encrypted handshake — usually a password mismatch. Join existing Nodes via the correct share link.');
-	if (rd.messages) {
-		rd.messages.push({ type: 'system', text: msg });
-	}
-	if (activeRoomIndex === idx) addSystemMsg(msg, true);
+	// 仅保留调用点（调试日志见 NodeCrypt 'pending-handshake'），聊天区不渲染任何内容
+	// Kept as a callback stub only (see NodeCrypt 'pending-handshake' debug log); nothing rendered
 }
 
 // Handle client left event
-// 处理客户端离开事件
-export function handleClientLeft(idx, clientId) {
+// explicit=true：主动离开（关标签/退出房间/APP 后台，服务端带 x 标记）→ 立即提示；
+// 否则（断网/息屏/杀进程等无操作断线）→ 挂起 45s 延迟判定：
+// 到期时同名成员已在房间（断线重连）则静默取消，否则才显示"离开对话"。
+// Handle client left event. explicit=true: intentional leave (tab close / room exit /
+// APP background; server sent the x marker) → instant notice. Otherwise (network loss /
+// screen off / process kill) → hold for 45s: silently cancel if a same-name member is
+// present by then (reconnect), otherwise show the "left" message.
+const LEAVE_CONFIRM_MS = 45000;
+
+export function handleClientLeft(idx, clientId, explicit = false) {
 	const rd = roomsData[idx];
 	if (!rd) return;
-	if (rd.pendingShown) {
-		delete rd.pendingShown[clientId]
-	}
 	if (rd.privateChatTargetId === clientId) {
 		rd.privateChatTargetId = null;
 		rd.privateChatTargetName = null;
@@ -274,11 +289,40 @@ export function handleClientLeft(idx, clientId) {
 	const user = rd.userMap[clientId];
 	const name = user ? (user.userName || user.username || user.name || 'Anonymous') : 'Anonymous';
 	const msg = `${name} ${t('system.left', 'left the conversation')}`;
-	rd.messages.push({
-		type: 'system',
-		text: msg
-	});
-	if (activeRoomIndex === idx) addSystemMsg(msg, true);
+	const pushLeftMessage = () => {
+		rd.messages.push({
+			type: 'system',
+			text: msg
+		});
+		if (activeRoomIndex === idx) addSystemMsg(msg, true);
+	};
+	if (explicit) {
+		pushLeftMessage();
+	} else {
+		// 无主动离开信号：挂起延迟判定（同 clientId 重复事件先清旧计时器）
+		// No explicit signal: hold for delayed judgment (clear a stale timer on duplicate events)
+		rd.pendingLeaves = rd.pendingLeaves || {};
+		if (rd.pendingLeaves[clientId]) {
+			clearTimeout(rd.pendingLeaves[clientId].timer);
+		}
+		rd.pendingLeaves[clientId] = {
+			name,
+			timer: setTimeout(() => {
+				// 到期时房间可能已销毁/切换：按 rd 身份守卫
+				// The room may be destroyed/switched by the time this fires: guard by rd identity
+				if (roomsData[idx] !== rd || !rd.pendingLeaves || !rd.pendingLeaves[clientId]) {
+					return
+				}
+				delete rd.pendingLeaves[clientId];
+				// 同名成员已在房间（断线重连，未走离开广播）：视为没离开，静默跳过
+				// Same-name member present (reconnected without a leave broadcast): treat as never left
+				const present = (rd.userList || []).some((u) => (u.userName || u.username || u.name || 'Anonymous') === name);
+				if (!present) {
+					pushLeftMessage();
+				}
+			}, LEAVE_CONFIRM_MS)
+		};
+	}
 	rd.userList = rd.userList.filter(u => u.clientId !== clientId);
 	delete rd.userMap[clientId];
 	if (window.voiceChat) {
@@ -443,11 +487,27 @@ export function exitRoom() {
 		window.voiceChat.leaveCall();
 	}
 	if (activeRoomIndex >= 0 && roomsData[activeRoomIndex]) {
-		const chatInst = roomsData[activeRoomIndex].chat;
+		const rd = roomsData[activeRoomIndex];
+		const chatInst = rd.chat;
+		// 先发主动离开（WS q + sendBeacon 兜底）再销毁实例 → 其他端立即提示"离开"
+		// Send the explicit leave (WS q + sendBeacon fallback) before tearing down → peers see "left" instantly
+		if (chatInst && typeof chatInst.leavePresence === 'function') {
+			try {
+				chatInst.leavePresence('exit-room');
+			} catch (error) { /* ignore */ }
+		}
 		if (chatInst && typeof chatInst.destruct === 'function') {
 			chatInst.destruct()
 		} else if (chatInst && typeof chatInst.disconnect === 'function') {
 			chatInst.disconnect()
+		}
+		// 清掉该房间的延迟离开计时器
+		// Clear held-leave timers for this room
+		if (rd.pendingLeaves) {
+			for (const pendingId of Object.keys(rd.pendingLeaves)) {
+				clearTimeout(rd.pendingLeaves[pendingId].timer);
+			}
+			rd.pendingLeaves = {};
 		}
 		roomsData[activeRoomIndex].chat = null;
 		roomsData.splice(activeRoomIndex, 1);
@@ -460,6 +520,32 @@ export function exitRoom() {
 	}
 	return false
 }
+
+// APP webview 桥（chat.vue 经 evalJS 调用）：APP 切后台/返回首页时让所有房间实例
+// 主动离开（对方立即看到"离开"）；回前台恢复在线（进入频道 → "加入"）。
+// APP webview bridge (invoked from chat.vue via evalJS): on APP background/home, every
+// room instance leaves explicitly (peers see "left" instantly); on foreground, resume
+// (entering the channel shows "joined").
+window.__ncPresenceLeave = (reason) => {
+	for (const rd of roomsData) {
+		const inst = rd && rd.chat;
+		if (inst && typeof inst.leavePresence === 'function') {
+			try {
+				inst.leavePresence(reason || 'app');
+			} catch (error) { /* ignore */ }
+		}
+	}
+};
+window.__ncPresenceResume = () => {
+	for (const rd of roomsData) {
+		const inst = rd && rd.chat;
+		if (inst && typeof inst.resumePresence === 'function') {
+			try {
+				inst.resumePresence();
+			} catch (error) { /* ignore */ }
+		}
+	}
+};
 
 export { roomsData, activeRoomIndex };
 
