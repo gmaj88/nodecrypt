@@ -60,6 +60,8 @@ import {
 	addMsg,               // 添加普通消息到聊天窗口 / Add a normal message to chat
 	addOtherMsg,          // 添加其他用户消息 / Add message from other users
 	addSystemMsg,         // 添加系统消息 / Add a system message
+	attachOutboxStatus,   // 出站消息附加"发送中/未送达"状态条 / Attach outbox delivery status
+	updateOutboxStatus,   // 发件箱状态快照 → 更新气泡状态条 / Outbox snapshot → bubble status
 	setupImagePreview,    // 设置图片预览功能 / Setup image preview
 	setupInputPlaceholder, // 设置输入框的占位提示 / Setup placeholder for input box
 	autoGrowInput         // 自动调整输入框高度 / Auto adjust input height
@@ -225,31 +227,17 @@ window.addEventListener('DOMContentLoaded', () => {
 				};
 
 				if (rd.privateChatTargetId) {
-					// 私聊图片消息加密并发送
-					// Encrypt and send private image message
-					const targetClient = rd.chat.channel[rd.privateChatTargetId];
-					if (targetClient && targetClient.shared) {
-						const clientMessagePayload = {
-							a: 'm',
-							t: 'image_private',
-							d: messageContent
-						};
-						const encryptedClientMessage = rd.chat.encryptClientMessage(clientMessagePayload, targetClient.shared);
-						const serverRelayPayload = {
-							a: 'c',
-							p: encryptedClientMessage,
-							c: rd.privateChatTargetId
-						};
-						const encryptedMessageForServer = rd.chat.encryptServerMessage(serverRelayPayload, rd.chat.serverShared);						rd.chat.sendMessage(encryptedMessageForServer);
-						addMsg(messageContent, false, 'image_private');
-					} else {
-						addSystemMsg(`${t('system.private_message_failed', 'Cannot send private message to')} ${rd.privateChatTargetName}. ${t('system.user_not_connected', 'User might not be fully connected.')}`)
-					}
+					// 私聊图片消息（按人投递：对方未就绪时排队补发）
+					// Private image message (per-recipient: queued and flushed when ready)
+					const status = rd.chat.sendPrivateMessage(rd.privateChatTargetId, 'image_private', messageContent);
+					const bubble = addMsg(messageContent, false, 'image_private');
+					if (status.queued) attachOutboxStatus(bubble, status.mid, status.offline)
 				} else {
-					// 公共频道图片消息发送
-					// Send image message to public channel
-					rd.chat.sendChannelMessage('image', messageContent);
-					addMsg(messageContent, false, 'image');
+					// 公共频道图片消息发送（已就绪成员立即收到，未就绪者排队补发）
+					// Public image message (ready peers get it now, the rest are queued)
+					const status = rd.chat.sendChannelMessage('image', messageContent);
+					const bubble = addMsg(messageContent, false, 'image');
+					if (status.queued) attachOutboxStatus(bubble, status.mid, status.offline)
 				}
 				
 				imagePasteHandler.clearImages(); // 清除所有图片预览
@@ -257,31 +245,18 @@ window.addEventListener('DOMContentLoaded', () => {
 				// 发送纯文本消息
 				// Send text-only message
 				if (rd.privateChatTargetId) {
-					// 私聊消息加密并发送
-					// Encrypt and send private message
-					const targetClient = rd.chat.channel[rd.privateChatTargetId];
-					if (targetClient && targetClient.shared) {
-						const clientMessagePayload = {
-							a: 'm',
-							t: 'text_private',
-							d: text
-						};
-						const encryptedClientMessage = rd.chat.encryptClientMessage(clientMessagePayload, targetClient.shared);
-						const serverRelayPayload = {
-							a: 'c',
-							p: encryptedClientMessage,
-							c: rd.privateChatTargetId
-						};
-						const encryptedMessageForServer = rd.chat.encryptServerMessage(serverRelayPayload, rd.chat.serverShared);
-						rd.chat.sendMessage(encryptedMessageForServer);					addMsg(text, false, 'text_private');
-					} else {
-						addSystemMsg(`${t('system.private_message_failed', 'Cannot send private message to')} ${rd.privateChatTargetName}. ${t('system.user_not_connected', 'User might not be fully connected.')}`)
-					}
+					// 私聊文本消息（按人投递：对方未就绪时排队补发）
+					// Private text message (per-recipient: queued and flushed when ready)
+					const status = rd.chat.sendPrivateMessage(rd.privateChatTargetId, 'text_private', text);
+					const bubble = addMsg(text, false, 'text_private');
+					if (status.queued) attachOutboxStatus(bubble, status.mid, status.offline)
 				} else {
-					// 公共频道消息发送
-					// Send public message
-					rd.chat.sendChannelMessage('text', text);
-					addMsg(text);				}
+					// 公共频道消息发送（已就绪成员立即收到，未就绪者排队补发）
+					// Public text message (ready peers get it now, the rest are queued)
+					const status = rd.chat.sendChannelMessage('text', text);
+					const bubble = addMsg(text);
+					if (status.queued) attachOutboxStatus(bubble, status.mid, status.offline)
+				}
 			}
 			
 			// 清空输入框并触发 input 事件
@@ -412,38 +387,24 @@ window.addEventListener('DOMContentLoaded', () => {
 				const userName = rd.myUserName || '';
 				const msgWithUser = { ...message, userName };
 				if (rd.privateChatTargetId) {
-					// 私聊文件加密并发送
-					// Encrypt and send private file message
-					const targetClient = rd.chat.channel[rd.privateChatTargetId];
-					if (targetClient && targetClient.shared) {
-						const clientMessagePayload = {
-							a: 'm',
-							t: msgWithUser.type + '_private',
-							d: msgWithUser
-						};
-						const encryptedClientMessage = rd.chat.encryptClientMessage(clientMessagePayload, targetClient.shared);
-						const serverRelayPayload = {
-							a: 'c',
-							p: encryptedClientMessage,
-							c: rd.privateChatTargetId
-						};
-						const encryptedMessageForServer = rd.chat.encryptServerMessage(serverRelayPayload, rd.chat.serverShared);
-						rd.chat.sendMessage(encryptedMessageForServer);
-						
-						// 添加到自己的聊天记录
-						if (msgWithUser.type === 'file_start') {
-							addMsg(msgWithUser, false, 'file_private');
-						}					} else {
-						addSystemMsg(`${t('system.private_file_failed', 'Cannot send private file to')} ${rd.privateChatTargetName}. ${t('system.user_not_connected', 'User might not be fully connected.')}`)
-					}
-				} else {
-					// 公共频道文件发送
-					// Send file to public channel
-					rd.chat.sendChannelMessage(msgWithUser.type, msgWithUser);
+					// 私聊文件发送（按人投递：对方未就绪时排队补发）
+					// Private file send (per-recipient: queued and flushed when ready)
+					const status = rd.chat.sendPrivateMessage(rd.privateChatTargetId, msgWithUser.type + '_private', msgWithUser);
 					
 					// 添加到自己的聊天记录
 					if (msgWithUser.type === 'file_start') {
-						addMsg(msgWithUser, false, 'file');
+						const bubble = addMsg(msgWithUser, false, 'file_private');
+						if (status.queued) attachOutboxStatus(bubble, status.mid, status.offline)
+					}
+				} else {
+					// 公共频道文件发送（已就绪成员立即收到，未就绪者排队补发）
+					// Send file to public channel (ready peers now, the rest queued)
+					const status = rd.chat.sendChannelMessage(msgWithUser.type, msgWithUser);
+					
+					// 添加到自己的聊天记录
+					if (msgWithUser.type === 'file_start') {
+						const bubble = addMsg(msgWithUser, false, 'file');
+						if (status.queued) attachOutboxStatus(bubble, status.mid, status.offline)
 					}
 				}
 			}		}
@@ -540,3 +501,11 @@ document.addEventListener('drop', (e) => {
 	dragCounter = 0;
 	hasTriggeredAttach = false;
 });
+
+// 发件箱状态桥：room.js 的 onOutbox 回调经此更新气泡状态条
+// Outbox bridge: room.js onOutbox callbacks update bubble status rows through this
+window.__ncOutboxUpdate = (snapshot) => {
+	try {
+		updateOutboxStatus(snapshot)
+	} catch (error) { /* ignore */ }
+};

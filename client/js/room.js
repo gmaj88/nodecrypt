@@ -160,7 +160,16 @@ export function joinRoom(userName, roomName, password, modal = null, onResult) {
 		onClientPending: (info) => handleClientPending(idx, info),
 		onClientList: (list, selfId, explicitLeft) => handleClientList(idx, list, selfId, explicitLeft),
 		onClientLeft: (clientId) => handleClientLeft(idx, clientId),
-		onClientMessage: (msg) => handleClientMessage(idx, msg)
+		onClientMessage: (msg) => handleClientMessage(idx, msg),
+		// 发件箱状态 → UI 气泡"发送中/重连后已发送/未送达"（处理函数在 main.js）
+		// Outbox state → bubble delivery status (handler lives in main.js)
+		onOutbox: (snapshot) => {
+			if (window.__ncOutboxUpdate) {
+				try {
+					window.__ncOutboxUpdate(snapshot)
+				} catch (error) { /* ignore */ }
+			}
+		}
 	};
 	chatInst = new window.NodeCrypt(window.config, callbacks);
 	chatInst.setCredentials(userName, roomName, password);
@@ -287,41 +296,49 @@ export function handleClientLeft(idx, clientId, explicit = false) {
 		}
 	}
 	const user = rd.userMap[clientId];
-	const name = user ? (user.userName || user.username || user.name || 'Anonymous') : 'Anonymous';
-	const msg = `${name} ${t('system.left', 'left the conversation')}`;
-	const pushLeftMessage = () => {
-		rd.messages.push({
-			type: 'system',
-			text: msg
-		});
-		if (activeRoomIndex === idx) addSystemMsg(msg, true);
-	};
-	if (explicit) {
-		pushLeftMessage();
-	} else {
-		// 无主动离开信号：挂起延迟判定（同 clientId 重复事件先清旧计时器）
-		// No explicit signal: hold for delayed judgment (clear a stale timer on duplicate events)
-		rd.pendingLeaves = rd.pendingLeaves || {};
-		if (rd.pendingLeaves[clientId]) {
-			clearTimeout(rd.pendingLeaves[clientId].timer);
-		}
-		rd.pendingLeaves[clientId] = {
-			name,
-			timer: setTimeout(() => {
-				// 到期时房间可能已销毁/切换：按 rd 身份守卫
-				// The room may be destroyed/switched by the time this fires: guard by rd identity
-				if (roomsData[idx] !== rd || !rd.pendingLeaves || !rd.pendingLeaves[clientId]) {
-					return
-				}
-				delete rd.pendingLeaves[clientId];
-				// 同名成员已在房间（断线重连，未走离开广播）：视为没离开，静默跳过
-				// Same-name member present (reconnected without a leave broadcast): treat as never left
-				const present = (rd.userList || []).some((u) => (u.userName || u.username || u.name || 'Anonymous') === name);
-				if (!present) {
-					pushLeftMessage();
-				}
-			}, LEAVE_CONFIRM_MS)
+	// 未完成握手的成员从未在界面上可见（"同步中"灰条）：直接摘除，不产生
+	// 离开提示/挂起判定——否则会产生 "Anonymous 离开了对话" 这类误导消息
+	// A member that never finished the handshake was never visible (the "syncing"
+	// grey row): remove silently — no notice, no held judgment (that would emit a
+	// misleading "Anonymous left the conversation")
+	const wasVisible = !!(user && (user.userName || user.username || user.name));
+	if (wasVisible) {
+		const name = user.userName || user.username || user.name || 'Anonymous';
+		const msg = `${name} ${t('system.left', 'left the conversation')}`;
+		const pushLeftMessage = () => {
+			rd.messages.push({
+				type: 'system',
+				text: msg
+			});
+			if (activeRoomIndex === idx) addSystemMsg(msg, true);
 		};
+		if (explicit) {
+			pushLeftMessage();
+		} else {
+			// 无主动离开信号：挂起延迟判定（同 clientId 重复事件先清旧计时器）
+			// No explicit signal: hold for delayed judgment (clear a stale timer on duplicate events)
+			rd.pendingLeaves = rd.pendingLeaves || {};
+			if (rd.pendingLeaves[clientId]) {
+				clearTimeout(rd.pendingLeaves[clientId].timer);
+			}
+			rd.pendingLeaves[clientId] = {
+				name,
+				timer: setTimeout(() => {
+					// 到期时房间可能已销毁/切换：按 rd 身份守卫
+					// The room may be destroyed/switched by the time this fires: guard by rd identity
+					if (roomsData[idx] !== rd || !rd.pendingLeaves || !rd.pendingLeaves[clientId]) {
+						return
+					}
+					delete rd.pendingLeaves[clientId];
+					// 同名成员已在房间（断线重连，未走离开广播）：视为没离开，静默跳过
+					// Same-name member present (reconnected without a leave broadcast): treat as never left
+					const present = (rd.userList || []).some((u) => (u.userName || u.username || u.name || 'Anonymous') === name);
+					if (!present) {
+						pushLeftMessage();
+					}
+				}, LEAVE_CONFIRM_MS)
+			};
+		}
 	}
 	rd.userList = rd.userList.filter(u => u.clientId !== clientId);
 	delete rd.userMap[clientId];
@@ -527,12 +544,26 @@ export function exitRoom() {
 // room instance leaves explicitly (peers see "left" instantly); on foreground, resume
 // (entering the channel shows "joined").
 window.__ncPresenceLeave = (reason) => {
-	for (const rd of roomsData) {
+	for (let i = 0; i < roomsData.length; i++) {
+		const rd = roomsData[i];
 		const inst = rd && rd.chat;
 		if (inst && typeof inst.leavePresence === 'function') {
 			try {
 				inst.leavePresence(reason || 'app');
 			} catch (error) { /* ignore */ }
+		}
+		if (rd) {
+			// 主动离开即清空本地在线视图：避免陈旧人数误导（此前 APP 回前台会一直
+			// 显示离开前的 3 人）；恢复后由服务器 roster 重建，头部显示真实的 1 人
+			// Clear the local presence view on explicit leave: stale counts mislead
+			// (the APP used to keep showing the pre-leave 3 members); the server roster
+			// rebuilds it on resume, so the header honestly shows just yourself
+			rd.userList = [];
+			rd.userMap = {};
+			if (activeRoomIndex === i) {
+				renderUserList(false);
+				renderMainHeader()
+			}
 		}
 	}
 };

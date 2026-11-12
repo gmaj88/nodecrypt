@@ -1084,6 +1084,36 @@ flex-direction: column;
 	color: #30a8f7;
 }
 
+/* 同步中成员（服务器 roster 在列、端到端握手未完成）：灰字占位，不可交互 */
+/* Syncing members (on the server roster, handshake unfinished): grey placeholder, non-interactive */
+.member.member-syncing {
+	opacity: 0.55;
+	pointer-events: none;
+}
+
+.member.member-syncing .member-name {
+	color: #999;
+	font-style: italic;
+}
+
+/* 消息气泡投递状态（发送中/重连后已发送/未送达） */
+/* Message bubble delivery status (sending / sent after reconnect / not delivered) */
+.bubble-status {
+	display: block;
+	font-size: 11px;
+	margin-top: 3px;
+	color: #999;
+}
+
+.bubble-status.bubble-status-failed {
+	color: #e05252;
+	font-weight: 500;
+}
+
+/* 主动离开后的重连状态条（头部计数旁的轻提示） */
+/* Light reconnect hint next to the header member count after an explicit leave */
+
+
 .member-tip {
   font-size: 13px;
   color: #888;

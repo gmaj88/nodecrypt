@@ -129,7 +129,53 @@ export function addMsg(text, isHistory = false, msgType = 'text', timestamp = nu
 		class: className
 	}, `<span class="bubble-content">${contentHtml}</span><span class="bubble-meta">${time}</span>`);
 	chatArea.appendChild(div);
-	scheduleScrollToBottom(chatArea)
+	scheduleScrollToBottom(chatArea);
+	return div
+}
+
+// 出站消息的投递状态条：排队（发送中）/已送达（移除）/未送达（标红）。
+// mid 由发件箱生成，NodeCrypt 状态回调经 main.js 的 __ncOutboxUpdate 到达这里
+// Outgoing message delivery status row: queued (sending) / delivered (removed) /
+// failed (red). mid comes from the outbox; the NodeCrypt callback reaches here
+// via main.js __ncOutboxUpdate
+export function attachOutboxStatus(bubble, mid, offline) {
+	if (!bubble || !mid) return bubble;
+	const status = document.createElement('span');
+	status.className = 'bubble-status';
+	status.dataset.outboxStatus = mid;
+	status.textContent = offline ?
+		t('ui.outbox_pending_offline', '待发送（重连后自动发出）') :
+		t('ui.outbox_sending', '发送中…');
+	bubble.appendChild(status);
+	return bubble
+}
+
+export function updateOutboxStatus(snapshot) {
+	if (!Array.isArray(snapshot)) return;
+	for (const entry of snapshot) {
+		const el = document.querySelector(`[data-outbox-status="${entry.mid}"]`);
+		if (!el) continue;
+		if (entry.done) {
+			// 已送达：掉线排队的显示"重连后已发送"角标（短暂保留），其余直接移除
+			// Delivered: offline-queued messages briefly show the "sent after reconnect"
+			// badge, others are cleared right away
+			if (entry.offline) {
+				el.textContent = t('ui.outbox_resent', '重连后已发送');
+				setTimeout(() => {
+					if (el.parentNode) el.remove()
+				}, 4000)
+			} else {
+				el.remove()
+			}
+		} else if (entry.failed > 0) {
+			el.textContent = t('ui.outbox_failed', '未送达（{n} 人未收到）').replace('{n}', String(entry.failed));
+			el.classList.add('bubble-status-failed')
+		} else if (entry.pending > 0) {
+			el.textContent = entry.offline ?
+				t('ui.outbox_pending_offline', '待发送（重连后自动发出）') :
+				t('ui.outbox_sending_n', '发送中…等待 {n} 人同步').replace('{n}', String(entry.pending))
+		}
+	}
 }
 
 // Add a message from another user to the chat area

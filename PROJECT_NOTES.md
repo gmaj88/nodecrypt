@@ -429,3 +429,14 @@ localStorage.removeItem('nodecrypt-debug');     // 关（默认）
 - **已知限制**：①强制杀 APP/系统清理：进程直接消失无法发信号 → 约 45s 后延迟提示；②浏览器刷新 = 真操作 → 立即"离开+加入"；③浏览器切标签/最小化（不关闭）= 延迟判定（可 45s+心跳超时 60s ≈ 105s 后提示）；④`/api/leave` 仅凭 hash+cid 鉴别（hash 由密码派生，仅房内成员可知），测试期可接受。
 - **测试清单**：两端静置无任何提示；APP 切后台/返回首页→对端立即"离开"、回前台→"加入"；关标签→立即"离开"；切标签 1 分钟内回来→无提示；飞行模式 10s 恢复→无提示无重复成员；杀 APP→约 45s 后"离开"；退出房间按钮→立即"离开"。
 - **推送/角标不受影响**：`leaveChannel`（含 q 与 close 路径）仍调用 `markDeviceOffline`；cleanup 逻辑未动；APP 未读计数/桥接（`nodecrypt-msg`、`syncActiveRoomHash`、`maybeMarkRead`）未改。
+
+## 16. 在线名单权威化 + 握手自愈 + 消息必达（2026-11-12，本轮实施）
+- **背景**：实测（1.1.3 重打包后）仍复现"APP 回前台/浏览器返回后对端看不到、发消息收不到"。根因链：后台冻结期间 close 事件未派发 → `resumePresence()` 只在 `isClosed()` 时重连 → 僵尸连接（无心跳/无重连/无入房），自己界面显示陈旧人数、消息静默丢弃；叠加"在线数=握手完成数"导致三端人数分歧、握手无自愈导致永久不可见。
+- **A. 僵尸连接根治**：`connect()` 连接代次守卫（socket.on* 闭包校验 `this.connection === socket`，旧 socket 迟到事件全部忽略，`disconnect` 只关当前连接）；`resumePresence()` **无条件新建连接**（不再看 readyState，心跳随 onOpen 启动）；`room.js __ncPresenceLeave` 主动离开即清空 `userList/userMap` 并重渲染（头部如实显示 1 人，杜绝陈旧 3 人）。
+- **B. 名单以服务器为准**：`l` 处理器把 **roster 全量**下发（未握手成员 `username:null`）；`ui.js renderMainHeader` 人数=roster+1，有同步中时显示 `N 在线成员 · X 同步中` 且**隐藏 8 位密码指纹**腾行宽；`createUserItem` 同步中成员灰字"同步中…"、禁点私聊（`.member-syncing` CSS）；服务端 `alarm()` 每 15s 对所有非空频道**重播 `l`**（丢一次广播最多 15s 收敛）；worker 每连接**串行化**消息处理（`clientQueues[clientId]` promise 链）杜绝中继乱序。
+- **C. 握手自愈（k:1 协议）**：客户端 `c` 第一分支先判 64-hex；收到密文但无 shared → 发 `{a:'c',n:0,k:1,c:对方}`（不再把密文当公钥解析抛异常）；对方收到 k:1 → 回我方公钥 +（用户名已知时）u，一轮往返双向恢复；worker `handleClientMessage` 透传 `k`。`armPendingPeerCheck` 到点改为**主动重发公钥**（≤3 次重挂），并修复新建条目漏挂检查。
+- **D. 消息必达（outbox 按人投递）**：`sendChannelMessage/sendPrivateMessage` 返回状态对象；已就绪成员立即收到，未就绪者入 `outbox`（`{mid,type,data,ts,pending,failedFor,isPrivate,offline}`，≤50 条）；触发补发：`l`（roster 变化）、`u`（成员就绪）、5s 兜底 tick；缺失者离开 roster → 标红"未送达"；30s 超时 → 剩余者标红；掉线整条排队（pending=null→roster），重连后自动发出。**只补发缺失者，绝不重复投递**；语音信令（voice-*）不排队。气泡状态条（chat.js `attachOutboxStatus/updateOutboxStatus` + `.bubble-status` CSS）：`待发送（重连后自动发出）`/`发送中…等待 N 人同步`/`重连后已发送`（4s 后消失）/`未送达（N 人未收到）`（红）。room.js `onOutbox` 回调 → `main.js window.__ncOutboxUpdate`。
+- **E. 参数**：worker `seenTimeout` 60s→90s（后台标签 ping 节流 ~1/min，60s 会误清理活连接）。
+- **i18n 新增**：`ui.syncing / ui.syncing_member / ui.outbox_pending_offline / ui.outbox_sending / ui.outbox_sending_n / ui.outbox_resent / ui.outbox_failed`（中英）。
+- **未完成握手的离开处理**：`handleClientLeft` 对从未 secured 的成员（"同步中"灰条）**静默摘除**，不产生提示/挂起判定（否则会误报 "Anonymous 离开了对话"）。
+- **测试清单**：①三人进房三端同显 3（含同步中→名字回填）；②APP 退后台→另两端立即"离开"显示 2，APP 自身头部显示 1；③回前台 ≤5s 三端恢复 3 且无重复"加入"；④浏览器切标签往返恢复；⑤飞行模式 10s 期间打字→恢复后自动发出带"重连后已发送"；⑥5 人房间 1 人弱网同步中→其余 4 人立即收到、1 人握手后补发、无重复；⑦杀 APP ~45s 另一端"离开"；⑧同名回归无提示；⑨离线推送/未读角标回归正常；⑩同步中成员发消息→头部"X 同步中"、指纹隐藏，同步完成后恢复。

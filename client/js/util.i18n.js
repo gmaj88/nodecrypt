@@ -99,6 +99,14 @@ const LANGUAGES = {
 			'system.user_not_connected': 'User might not be fully connected.',
 			'system.pending_handshake': '[Notice] A member failed to complete the encrypted handshake — usually a password mismatch (joined by typing the room name instead of using the share link). Ask the creator to resend the share link.',
 			'system.share_verify_failed': 'Share link verification failed — the embedded password may have been altered or truncated. Ask the creator to re-copy the link.',
+					// Presence sync & outbox delivery status
+			'ui.syncing': 'syncing',
+			'ui.syncing_member': 'Syncing…',
+			'ui.outbox_pending_offline': 'Queued (will send after reconnect)',
+			'ui.outbox_sending': 'Sending…',
+			'ui.outbox_sending_n': 'Sending… waiting for {n} to sync',
+			'ui.outbox_resent': 'Sent after reconnect',
+			'ui.outbox_failed': 'Not delivered ({n} missed)',
 					// Voice chat
 			'voice.join_call': 'Join Voice Chat',
 			'voice.leave_call': 'Leave Voice Chat',
@@ -262,6 +270,14 @@ const LANGUAGES = {
 			'system.user_not_connected': '用户可能未完全连接。',
 			'system.pending_handshake': '[提示] 有成员未能完成加密握手——通常是密码不一致（手动输入房间名而非通过分享链接加入）。请房主重新发送分享链接。',
 			'system.share_verify_failed': '分享链接校验失败——链接中的密码可能被改动或截断，请房主重新复制链接。',
+					// 同步状态与消息投递状态
+			'ui.syncing': '同步中',
+			'ui.syncing_member': '同步中…',
+			'ui.outbox_pending_offline': '待发送（重连后自动发出）',
+			'ui.outbox_sending': '发送中…',
+			'ui.outbox_sending_n': '发送中…等待 {n} 人同步',
+			'ui.outbox_resent': '重连后已发送',
+			'ui.outbox_failed': '未送达（{n} 人未收到）',
 					// Voice chat
 			'voice.join_call': '加入语音通话',
 			'voice.leave_call': '离开语音通话',

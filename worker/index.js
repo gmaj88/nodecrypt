@@ -76,9 +76,17 @@ export class ChatRoom {  constructor(state, env) {
     // Use objects like original server.js instead of Maps
     this.clients = {};
     this.channels = {};
+    // 每连接的串行处理队列：加密中继含多次 await，并发处理会把后续消息先转发
+    // （如"公钥"晚于其后的加密 u 到达接收端），造成握手竞态永久卡死
+    // Per-connection serial queues: relays involve several awaits; concurrent
+    // processing can reorder deliveries (a key arriving after a later encrypted u)
+    // and permanently wedge handshakes
+    this.clientQueues = {};
     
     this.config = {
-      seenTimeout: 60000,
+      // 90s：后台标签定时器被节流到 ~1/min，60s 会把还活着的连接误清理
+      // 90s: background tabs throttle timers to ~1/min; 60s reaped live connections
+      seenTimeout: 90000,
       // 周期清理 alarm 间隔：不再依赖"有人新连接"才触发 cleanupOldConnections，
       // 旧连接的超时清理与成员变化广播由 alarm 兜底
       // Periodic-cleanup alarm interval: cleanup no longer depends on new connections
@@ -361,9 +369,12 @@ export class ChatRoom {  constructor(state, env) {
         return;
       }
 
-      // Handle encrypted messages
+      // Handle encrypted messages (serialized per connection — see clientQueues)
       if (this.clients[clientId].shared && message.length <= (8 * 1024 * 1024)) {
-        this.processEncryptedMessage(clientId, message);
+        const previous = this.clientQueues[clientId] || Promise.resolve();
+        this.clientQueues[clientId] = previous
+          .catch(() => {})
+          .then(() => this.processEncryptedMessage(clientId, message));
       }
     });    // Handle connection close
     connection.addEventListener('close', async (event) => {
@@ -373,6 +384,7 @@ export class ChatRoom {  constructor(state, env) {
       // → 客户端按 45s 延迟判定提示"离开"，期间同名重连则静默取消
       // Abrupt close (no explicit-leave signal): remove and broadcast without the x
       // marker → clients apply the 45s delayed judgment; a same-name rejoin cancels it
+      delete(this.clientQueues[clientId]);
       await this.leaveChannel(clientId, false);
 
       // cleanupOldConnections 可能已删除该客户端，需要防御缺失
@@ -519,6 +531,11 @@ export class ChatRoom {  constructor(state, env) {
           p: decrypted.p,
           c: clientId
         };
+        // 握手自愈标记透传：k:1 = "我缺少你的公钥，请重发"（客户端协议，见 NodeCrypt）
+        // Pass through the handshake-heal flag: k:1 = "I lack your public key, resend"
+        if (decrypted.k === 1) {
+          messageObj.k = 1;
+        }
 
         const encrypted = encryptMessage(messageObj, targetClient.shared);
         this.sendMessage(targetClient.connection, encrypted);
@@ -700,6 +717,7 @@ export class ChatRoom {  constructor(state, env) {
           }
         }
         delete this.clients[clientId];
+        delete this.clientQueues[clientId];
       } catch (error) {
         logEvent('connection-seen', error, 'error');
       }
@@ -750,13 +768,21 @@ export class ChatRoom {  constructor(state, env) {
     }
   }
 
-  // DO alarm 回调：周期执行清理，保证仅在 join/close 触发清理时不会被漏掉的
-  // 半开连接最终也能被摘除并广播
-  // DO alarm callback: run cleanup periodically so half-open sockets that no
-  // join/close event would surface still get reaped and members rebroadcast
+  // DO alarm 回调：周期执行清理 + 名单重播，保证仅在 join/close 触发时会被漏掉的
+  // 半开连接最终被摘除；任何端丢一次名单广播最多 15s 自动收敛，
+  // 未完成握手的成员也会因重播重新触发密钥交换
+  // DO alarm callback: periodic cleanup + roster rebroadcast so half-open sockets
+  // that no join/close event would surface still get reaped; a missed roster
+  // broadcast converges within 15s and re-triggers key exchange for unfinished
+  // handshakes
   async alarm() {
     try {
       await this.cleanupOldConnections();
+      // 名单重播（所有非空频道）：客户端人数以此保持三端一致
+      // Roster rebroadcast (all non-empty channels): keeps member counts consistent
+      for (const channel of Object.keys(this.channels)) {
+        this.broadcastMemberList(channel);
+      }
     } catch (error) {
       logEvent('alarm-cleanup', error, 'error');
     }
