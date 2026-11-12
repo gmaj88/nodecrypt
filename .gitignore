@@ -1,8 +1,10 @@
 node_modules/
 dist/
+.gitignore
 .wrangler/
 .dev.vars
 *.log
 .DS_Store
 Thumbs.db
+PROJECT_NOTES.md
 uniapp/

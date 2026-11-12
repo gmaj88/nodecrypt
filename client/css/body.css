@@ -598,3 +598,5 @@ body {
   position: relative;
   z-index: 1;
 }
+
+#share-link-copy { padding: 20px;}
