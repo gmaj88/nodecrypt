@@ -233,7 +233,8 @@ async function decompressVolumesToFile(volumes, fileName, originalHash = null) {
 					}
 				}
 				
-				// Create blob and download
+				// Create blob and download（下载触发 pagehide 的浏览器上：申请暂离抑制短窗）
+				try { window.dispatchEvent(new CustomEvent('nodecrypt-suppress-leave')) } catch (e) {}
 				const blob = new Blob([decompressed]);
 				const url = URL.createObjectURL(blob);
 				const a = document.createElement('a');
@@ -315,7 +316,8 @@ async function decompressArchiveToFiles(volumes, fileManifest, archiveHash = nul
 					const fileData = decompressed.slice(dataOffset, dataOffset + fileSize);
 					dataOffset += fileSize;
 					
-					// Create and download file
+					// Create and download file（下载触发 pagehide 的浏览器上：申请暂离抑制短窗）
+					try { window.dispatchEvent(new CustomEvent('nodecrypt-suppress-leave')) } catch (e) {}
 					const blob = new Blob([fileData]);
 					const url = URL.createObjectURL(blob);
 					const a = document.createElement('a');

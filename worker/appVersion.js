@@ -6,15 +6,15 @@
 //  随 Worker 静态资源部署；mirror 字段仅构建用，/api/app-version 不返回。）
 // Release: https://github.com/gmaj88/nodecrypt/releases (tag: app-vX.Y.Z)
 export const APP_VERSION = {
-	versionCode: 113,
-	versionName: '1.1.3',
-	url: 'https://github.com/gmaj88/nodecrypt/releases/download/app-v1.1.3/Channel-1.1.3.apk',
+	versionCode: 120,
+	versionName: '1.2.0',
+	url: 'https://github.com/gmaj88/nodecrypt/releases/download/app-v1.2.0/Channel-1.2.0.apk',
 	size: 0,
 	sha256: '',
 	note: '',
 	force: false,
 	mirror: {
-		source: 'https://github.com/gmaj88/nodecrypt/releases/download/app-v1.1.3/Channel-1.1.3.apk',
-		path: 'app/Channel-1.1.3.apk'
+		source: 'https://github.com/gmaj88/nodecrypt/releases/download/app-v1.2.0/Channel-1.2.0.apk',
+		path: 'app/Channel-1.2.0.apk'
 	}
 };

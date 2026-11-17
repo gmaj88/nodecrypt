@@ -26,13 +26,13 @@ class NodeCrypt {
 			rsaPublic: config.rsaPublic || '',
 			wsAddress: config.wsAddress || '',
 			reconnectDelay: config.reconnectDelay || 3000,
-			// 心跳 10s + pong 看门狗 25s：半开/静默断链最多 ~25s 即被检测并强制重连
-			// （修复"手机新进房约 1 分钟才互相可见"：此前 pong 被忽略，只能等 OS TCP 超时）
-			// Heartbeat 10s + pong watchdog 25s: half-open/silently broken sockets are detected
-			// within ~25s and force-reconnected (previously pong was ignored and recovery
-			// waited for the OS TCP timeout, ~1 minute)
+			// 10s 心跳 + 60s pong 看门狗：后台标签的定时器被节流到 ~1/min，25s 会把
+			// 活连接误杀成半开连接；60s + 任意帧算存活后只在真正前台无响应时自杀
+			// 10s heartbeat + 60s pong watchdog: background tabs throttle timers to
+			// ~1/min; 25s killed throttled-but-alive links. 60s + any-frame liveness
+			// only self-kills when the visible foreground truly stops responding
 			pingInterval: config.pingInterval || 10000,
-			pongTimeout: config.pongTimeout || 25000,
+			pongTimeout: config.pongTimeout || 60000,
 			pendingHandshakeTimeout: config.pendingHandshakeTimeout || 20000,
 			debug: config.debug || false,
 		};
@@ -171,9 +171,18 @@ class NodeCrypt {
 
 	// Set user credentials (username, channel, password)
 	// 设置用户凭证（用户名、频道、密码）
+	// uid = sha256(密码哈希|频道哈希|用户名)：同频道同名视为同一人，服务端据此
+	// 顶掉旧连接（无重复成员）；名单带 u 映射让对端合并/迁移待投递。
+	// 密码哈希不上送明文，服务端无法反推。
+	// uid = sha256(password-hash | channel-hash | username): same channel + same
+	// username is one identity; the server replaces the older connection and the
+	// roster's u map lets peers merge/migrate pending deliveries. The password hash
+	// itself is never sent in the clear.
 	setCredentials(username, channel, password) {
 		this.logEvent('setCredentials');
 		try {
+			const channelHash = sha256(String(channel) + '\u0000' + String(password || ''));
+			const passwordHash = sha256(password);
 			this.credentials = {
 				// 服务器频道/推送桶 = sha256(房间名 + NUL + 密码)：同名+不同密码的房间
 				// 彻底隔离（WS 频道、设备注册、离线推送互不串扰，修复 §13.14 同名串频）。
@@ -182,8 +191,9 @@ class NodeCrypt {
 				// rooms with different passwords are now fully isolated (WS channel, device
 				// registry, offline push). Output stays 64-hex so [hash12] keeps its length.
 				username: username,
-				channel: sha256(String(channel) + '\u0000' + String(password || '')),
-				password: sha256(password)
+				channel: channelHash,
+				password: passwordHash,
+				uid: sha256(passwordHash + '|' + channelHash + '|' + String(username))
 			}
 		} catch (error) {
 			this.logEvent('setCredentials', error, 'error');
@@ -203,7 +213,13 @@ class NodeCrypt {
 		this.stopPing();
 		this.serverKeys = null;
 		this.serverShared = null;
-		this.channel = {};
+		// 保留 peer 表（shared/username/keys 与服务器连接无关）：重连不再全员重新
+		// 握手（此前清空导致每次重连都把所有对端打回"同步中"，名单长时间不一致）；
+		// 已离开的成员由名单帧剪除。
+		// Keep the peer table (shared/username/keys are independent of the server
+		// connection): reconnects no longer force a full re-handshake (clearing it
+		// knocked every peer back to "syncing" and left rosters inconsistent for
+		// minutes); members who actually left are pruned by the roster frame.
 		this.clearPendingPeerTimers();
 		this.connectStartedAt = Date.now();
 		this.lastPongAt = 0;
@@ -267,7 +283,7 @@ class NodeCrypt {
 			wsAddress: '',
 			reconnectDelay: 3000,
 			pingInterval: 10000,
-			pongTimeout: 25000,
+			pongTimeout: 60000,
 			pendingHandshakeTimeout: 20000,
 			debug: false,
 		};
@@ -326,14 +342,13 @@ class NodeCrypt {
 		if (!event || !this.isString(event.data)) {
 			return
 		}
+		// 任意入站帧都是连通证据（名单/中继/pong）：只认 pong 会把"节流中的活连接"
+		// 误判成半开连接并自杀重连（2-3 分钟周期性断线的主要嫌疑之一）
+		// Any inbound frame is proof of life (roster / relay / pong): trusting only
+		// pongs misjudged throttled-but-alive links as half-open and self-killed them
+		this.lastPongAt = Date.now();
 		if (event.data === 'pong') {
-			// pong 是唯一可信的连通证据：更新看门狗时间戳（此前被直接忽略，
-			// 半开连接要等 OS TCP 超时 ~1 分钟才被发现）
-			// pong is the only trustworthy liveness proof: refresh the watchdog timestamp
-			// (previously it was ignored, so half-open sockets were only detected after
-			// the OS TCP timeout, ~1 minute)
 			const rtt = this.lastPingSentAt ? (Date.now() - this.lastPingSentAt) : null;
-			this.lastPongAt = Date.now();
 			this.logEvent('pong', rtt !== null ? (rtt + 'ms') : '');
 			return
 		}
@@ -369,10 +384,15 @@ class NodeCrypt {
 							namedCurve: 'P-384'
 						}, true, [])
 					}, this.serverKeys.privateKey, 384)).slice(8, 40);
-					this.sendMessage(this.encryptServerMessage({
-						a: 'j',
-						p: this.credentials.channel
-					}, this.serverShared));
+				// 加入频道帧带 uid（身份指纹）：服务端据此顶掉同频道同名旧连接，
+				// 消灭"幽灵成员/重复成员"
+				// Join frame carries the uid identity fingerprint: the server replaces the
+				// same-name old connection, eliminating ghost/duplicate members
+				this.sendMessage(this.encryptServerMessage({
+					a: 'j',
+					p: this.credentials.channel,
+					uid: this.credentials.uid
+				}, this.serverShared));
 					// 向服务器注册离线推送设备（加密通道内,服务器只知道房间哈希）
 					// Register offline push device (inside the encrypted channel, server only knows the room hash)
 					this.initPushTokenRegistration();
@@ -401,8 +421,16 @@ class NodeCrypt {
 				this.selfId = serverDecrypted.i;
 			}
 			const explicitLeftIds = this.isArray(serverDecrypted.x) ? serverDecrypted.x.filter((value) => this.isString(value)) : null;
+			// 成员身份映射 u: {clientId: uid}（新服务端才有）：用于同名重连合并与待投递迁移
+			// Identity map u: {clientId: uid} (new servers only): merges same-name
+			// reconnects and migrates pending deliveries
+			const uidMap = (serverDecrypted.u && this.isObject(serverDecrypted.u)) ? serverDecrypted.u : null;
 			let logListResend = 0;
 			try {
+				// 同 uid 的新 id 接替被剪除的旧 id：待投递目标先迁移，避免消息丢失
+				// A same-uid new id takes over from the pruned old id: retarget pending
+				// deliveries first so queued messages are never lost
+				this.retargetOutboxByUid(uidMap);
 				for (const clientId in this.channel) {
 					if (serverDecrypted.p.indexOf(clientId) < 0) {
 						if (this.pendingPeerTimers[clientId]) {
@@ -415,11 +443,23 @@ class NodeCrypt {
 				let payloads = {};
 				for (const clientId of serverDecrypted.p) {
 					let entry = this.channel[clientId];
+					if (uidMap && uidMap[clientId]) {
+						if (entry && entry.uid && entry.uid !== uidMap[clientId]) {
+							// 同 id 换了身份（异常场景）：作废旧握手，强制重新协商
+							// Identity changed for the same id (abnormal): invalidate and renegotiate
+							entry.keys = this.clientEc.genKeyPair();
+							entry.shared = null;
+							entry.username = null;
+						} else if (entry && !entry.uid) {
+							entry.uid = uidMap[clientId]
+						}
+					}
 					if (!entry) {
 						entry = this.channel[clientId] = {
 							username: null,
 							keys: this.clientEc.genKeyPair(),
 							shared: null,
+							uid: (uidMap && uidMap[clientId]) || null,
 						};
 						payloads[clientId] = entry.keys.getPublic('hex')
 					} else if (!entry.shared || !entry.username) {
@@ -431,11 +471,14 @@ class NodeCrypt {
 						logListResend += 1;
 						payloads[clientId] = entry.keys.getPublic('hex')
 					}
-					// 新建条目也要挂未握手检查（此前 entry 为 undefined 时漏挂，
-					// 单独新建的成员永不进入重发兜底）
-					// Newly created entries must be armed too (the old code skipped them
-					// because `entry` was still undefined at that point)
+					// 未握手检查：名单到来即重置退避（重启 20s 周期），保证收敛不再依赖运气
+					// Pending check resets its backoff on every roster so convergence never
+					// depends on luck
 					if (!entry.username) {
+						if (this.pendingPeerTimers[clientId]) {
+							clearTimeout(this.pendingPeerTimers[clientId]);
+							delete this.pendingPeerTimers[clientId]
+						}
 						this.armPendingPeerCheck(clientId)
 					}
 				}
@@ -456,16 +499,19 @@ class NodeCrypt {
 			}
 			if (this.callbacks.onClientList) {
 				// 名单以服务器 roster 为准：未完成握手的成员也下发（username 为 null），
-				// UI 显示"同步中"，人数在各端保持一致；握手完成后名字自动回填
+				// UI 显示"同步中"，人数在各端保持一致；握手完成后名字自动回填；
+				// uid 供 UI 合并同名重连的短暂双条目
 				// The server roster is authoritative: members without a finished handshake
 				// are included too (username null, rendered as "syncing"), keeping member
-				// counts identical across terminals; names fill in once secured
+				// counts identical across terminals; names fill in once secured. uid lets
+				// the UI merge the transient duplicate entries of a same-name reconnect
 				let clients = [];
 				for (const clientId in this.channel) {
 					const entry = this.channel[clientId];
 					clients.push({
 						clientId: clientId,
-						username: (entry.shared && entry.username) ? entry.username : null
+						username: (entry.shared && entry.username) ? entry.username : null,
+						uid: entry.uid || null
 					})
 				}
 				try {
@@ -562,12 +608,14 @@ class NodeCrypt {
 			const resendEntry = this.channel[serverDecrypted.c];
 			if (serverDecrypted.k === 1) {
 				// 对方缺少我方公钥（其 shared 未建立，见第一分支的 k:1 请求）：
-				// 重发我方公钥；若用户名已知，紧随其后补发 u——对方拿到公钥 derive 后
-				// 立即可解，双向握手一次恢复（同 socket 顺序传输保证公钥先于 u 到达）
+				// 重发我方公钥；紧随补发 u——u 必须是本端用户名（旧实现误用对端名字，
+				// 会造成名字串位）；对方拿到公钥 derive 后立即可解，双向握手一次恢复
+				// （同 socket 顺序传输保证公钥先于 u 到达）
 				// The peer lacks our public key (their shared is unset, see the k:1 request
-				// in the first branch): re-send our key; if the username is known, follow
-				// with u — once they derive, they can decrypt immediately and the handshake
-				// heals in one round trip (same-socket ordering guarantees key-before-u)
+				// in the first branch): re-send our key, then our OWN username (the old code
+				// wrongly used the peer's name) — once they derive, they can decrypt
+				// immediately and the handshake heals in one round trip (same-socket
+				// ordering guarantees key-before-u)
 				try {
 					this.sendMessage(this.encryptServerMessage({
 						a: 'c',
@@ -575,13 +623,13 @@ class NodeCrypt {
 						p: resendEntry.keys.getPublic('hex'),
 						c: serverDecrypted.c
 					}, this.serverShared));
-					if (resendEntry.username) {
+					if (this.credentials && this.credentials.username) {
 						this.sendMessage(this.encryptServerMessage({
 							a: 'c',
 							n: 0,
 							p: this.encryptClientMessage({
 								a: 'u',
-								p: resendEntry.username
+								p: this.credentials.username
 							}, resendEntry.shared),
 							c: serverDecrypted.c
 						}, this.serverShared))
@@ -741,10 +789,14 @@ class NodeCrypt {
 		}
 	}
 
-	// Start ping timer (10s 心跳 + 25s pong 看门狗)
-	// 心跳只发不判时，半开连接要等 OS TCP 超时才能恢复（实测 ~1 分钟）。
-	// Start ping timer (10s heartbeat + 25s pong watchdog; a half-open socket would
-	// otherwise only be detected via the OS TCP timeout, ~1 minute)
+	// Start ping timer (10s 心跳 + 60s pong 看门狗)
+	// 看门狗只在页面可见时判死：后台标签的定时器/网络被节流，pong 迟到不代表连接死；
+	// 后台断链由 resume/visibilitychange 探测兜底（此前 25s 看门狗把节流中的活连接
+	// 误杀成 2-3 分钟周期性断线的主要来源）。
+	// Start ping timer (10s heartbeat + 60s pong watchdog). The watchdog only declares
+	// death while the page is visible: background tabs have throttled timers/network so
+	// late pongs do not mean a dead link; background drops are covered by the resume
+	// probe. (The old 25s watchdog was the main source of the periodic 2-3 minute drops.)
 	startPing() {
 		this.stopPing();
 		this.logEvent('startPing');
@@ -754,6 +806,10 @@ class NodeCrypt {
 			}
 			const now = Date.now();
 			if (this.lastPongAt && now - this.lastPongAt > this.config.pongTimeout) {
+				if (typeof document !== 'undefined' && document.visibilityState !== 'visible') {
+					this.logEvent('ping-watchdog', 'no pong but page hidden, skip force-reconnect', 'warn');
+					return
+				}
 				this.logEvent('ping-watchdog', 'no pong for ' + (now - this.lastPongAt) + 'ms, forcing reconnect', 'warn');
 				this.forceReconnect('ping-watchdog');
 				return
@@ -851,12 +907,26 @@ class NodeCrypt {
 				refresh('online');
 			}
 		});
-		// 关标签/页面卸载：尽力发出主动离开（WS q + sendBeacon 兜底）
-		// Tab close / page unload: best-effort explicit leave (WS q + sendBeacon fallback)
+		// 关标签/页面卸载：尽力发出主动离开（WS q + sendBeacon 兜底）。
+		// 原生文件对话框/下载预览在部分浏览器也会触发 pagehide，但用户仍在会话中——
+		// 短窗内（suppressNextLeave）跳过主动离开，避免误报"离开对话"
+		// Tab close / page unload: best-effort explicit leave (WS q + sendBeacon fallback).
+		// Native file pickers / download previews also fire pagehide in some browsers
+		// while the user is still in the room — a short suppress window skips the leave
 		window.addEventListener('pagehide', () => {
 			if (this.credentials) {
+				if (this.suppressLeaveUntil && Date.now() < this.suppressLeaveUntil) {
+					this.logEvent('pagehide', 'suppressed (file dialog/download)');
+					return
+				}
 				this.leavePresence('pagehide');
 			}
+		});
+		// 文件选择/下载入口通过该事件申请短窗抑制（无需拿到 session 实例）
+		// File pickers / downloads request a short suppress window via this event
+		// (they don't need a reference to the session instance)
+		window.addEventListener('nodecrypt-suppress-leave', () => {
+			this.suppressNextLeave(30000)
 		});
 		// bfcache 恢复（前进/后退缓存复用页面）时需要恢复在线
 		// bfcache restore reuses the page; presence must resume
@@ -877,29 +947,32 @@ class NodeCrypt {
 	}
 
 	// 某 peer 的 username 尚未到达时挂一个 20s 检查：到点仍未 secured → 主动重发我方
-	// 公钥触发对方响应并重新挂检查（最多 3 次）；配合服务器 15s 名单重播保证最终收敛。
-	//（此前 8s 只打日志不补救，弱网/丢包下握手可永久卡死）
+	// 公钥触发对方响应并重新挂检查，指数退避 20s→40s→80s（封顶 120s）且**永续**——
+	// 旧实现 3 次后放弃，名单会永久停着一个"同步中"僵尸成员；掉线期间（socket 不开）
+	// 不推进退避计数，重连后从头开始。配合服务器 15s 名单重播保证最终收敛。
 	// When a peer has no username yet, arm a 20s check: on timeout re-send our public
-	// key to trigger the peer and re-arm (up to 3 attempts); together with the 15s
-	// server roster rebroadcast this guarantees convergence. (Previously it only
-	// logged and gave up, so a lost packet could wedge the handshake forever.)
+	// key and re-arm with exponential backoff 20s→40s→80s (capped 120s), forever —
+	// the old code gave up after 3 attempts and left a permanent "syncing" zombie in
+	// the roster. While offline the attempt counter does not advance; backoff restarts
+	// after reconnect. The 15s server roster rebroadcast guarantees convergence.
 	armPendingPeerCheck(peerId, attempt = 0) {
 		if (this.pendingPeerTimers[peerId]) {
 			return
 		}
+		const delay = Math.min(this.config.pendingHandshakeTimeout * Math.pow(2, attempt), 120000);
 		this.pendingPeerTimers[peerId] = setTimeout(() => {
 			delete this.pendingPeerTimers[peerId];
 			const entry = this.channel[peerId];
 			if (!entry || entry.username) {
 				return
 			}
-			this.logEvent('pending-handshake', [peerId, attempt], 'warn');
+			this.logEvent('pending-handshake', [peerId, attempt, delay + 'ms'], 'warn');
 			// 主动重发我方公钥：对方 shared 未建立则 derive 后回 u；已建立则回 u。
 			// 我方连对方公钥都没有时，对方回的 u 会让第一分支走 k:1 请求，链式自愈
 			// Re-send our public key: the peer derives (if their shared is unset) and
 			// replies u. If we lack THEIR key, their u hits the k:1 heal in our first
 			// branch — the whole chain recovers automatically
-			if (attempt < 3 && this.isOpen() && this.serverShared) {
+			if (this.isOpen() && this.serverShared) {
 				try {
 					this.sendMessage(this.encryptServerMessage({
 						a: 'c',
@@ -921,8 +994,10 @@ class NodeCrypt {
 				} catch (error) {
 					this.logEvent('pending-handshake-resend', error, 'error')
 				}
-				this.armPendingPeerCheck(peerId, attempt + 1)
 			}
+			// 永续重试；本轮未发出（掉线）则退避不推进
+			// Keep retrying forever; a failed round (offline) does not advance the backoff
+			this.armPendingPeerCheck(peerId, this.isOpen() && this.serverShared ? attempt + 1 : 0);
 			if (this.callbacks.onClientPending) {
 				try {
 					this.callbacks.onClientPending({ clientId: peerId })
@@ -930,7 +1005,7 @@ class NodeCrypt {
 					this.logEvent('onClientPending-callback', error, 'error')
 				}
 			}
-		}, this.config.pendingHandshakeTimeout)
+		}, delay)
 	}
 
 	// Stop ping timer
@@ -968,6 +1043,14 @@ class NodeCrypt {
 	// Explicit leave: the server drops us at once (others see "left" instantly) and auto-reconnect
 	// is paused. Sources: APP background/home (uni bridge evalJS), browser pagehide (tab close),
 	// and the exit-room button.
+
+	// 暂离抑制短窗：原生文件对话框/下载触发的 pagehide 不代表用户离开
+	// Short suppress window: a pagehide caused by a native file dialog / download
+	// does not mean the user left
+	suppressNextLeave(ms) {
+		this.suppressLeaveUntil = Date.now() + (ms || 30000)
+	}
+
 	leavePresence(reason) {
 		if (this.paused) {
 			return
@@ -1053,17 +1136,30 @@ class NodeCrypt {
 	// ---------- Per-recipient outbox ----------
 
 	// 入队一条待补发消息。missingIds=null 表示掉线场景（全部 roster 待发）；
-	// private=true 走定向 a:'c' 中继，否则走 a:'w' 频道封装
+	// private=true 走定向 a:'c' 中继，否则走 a:'w' 频道封装。
+	// 记录每个待投递目标的 uid：成员重连换 id 后按 uid 迁移，消息不丢
 	// Queue a message for later delivery. missingIds=null = offline (whole roster
-	// pending); private=true relays via targeted a:'c', otherwise via a:'w'
+	// pending); private=true relays via targeted a:'c', otherwise via a:'w'. Each
+	// pending target's uid is recorded so deliveries migrate by uid when a member
+	// reconnects with a new id
 	queueOutbox(type, data, missingIds, offline, isPrivate) {
 		this.outboxSeq += 1;
+		const uidFor = {};
+		if (missingIds) {
+			for (const clientId of missingIds) {
+				const peerEntry = this.channel[clientId];
+				if (peerEntry && peerEntry.uid) {
+					uidFor[clientId] = peerEntry.uid
+				}
+			}
+		}
 		const entry = {
 			mid: 'ob' + this.outboxSeq + '_' + Date.now(),
 			type: type,
 			data: data,
 			ts: Date.now(),
 			pending: missingIds,
+			uidFor: uidFor,
 			failedFor: null,
 			isPrivate: !!isPrivate,
 			offline: !!offline,
@@ -1077,6 +1173,55 @@ class NodeCrypt {
 		}
 		this.armOutboxTimer();
 		return entry
+	}
+
+	// 按 uid 迁移待投递目标：成员重连后旧 id 从名单消失，同 uid 的新 id 接替。
+	// 只迁移"从未送达"的目标（pending 集合内的 id 发送时即缺失），不会造成重复投递。
+	// Retarget pending deliveries by uid: after a member reconnects, the old id is
+	// gone from the roster and the same-uid new id takes over. Only "never delivered"
+	// targets migrate (ids in the pending set were missing at send time), so no
+	// duplicate delivery can happen.
+	retargetOutboxByUid(uidMap) {
+		if (!uidMap || !this.outbox.length) {
+			return
+		}
+		let migrated = 0;
+		for (const entry of this.outbox) {
+			if (entry.done || !entry.pending || (entry.failedFor && entry.failedFor.length)) {
+				continue
+			}
+			const next = [];
+			let dirty = false;
+			for (const clientId of entry.pending) {
+				if (this.channel[clientId]) {
+					next.push(clientId);
+					continue
+				}
+				const uid = entry.uidFor ? entry.uidFor[clientId] : null;
+				if (uid) {
+					let mapped = null;
+					for (const id in uidMap) {
+						if (uidMap[id] === uid) {
+							mapped = id;
+							break
+						}
+					}
+					if (mapped) {
+						next.push(mapped);
+						migrated += 1;
+						dirty = true;
+						continue
+					}
+				}
+				next.push(clientId)
+			}
+			if (dirty) {
+				entry.pending = next
+			}
+		}
+		if (migrated > 0) {
+			this.logEvent('outbox-retarget', migrated)
+		}
 	}
 
 	// 5s 周期兜底：超时（30s）标记失败；期间持续尝试补发
@@ -1095,10 +1240,14 @@ class NodeCrypt {
 	}
 
 	// 补发 + 状态通知。就绪成员单独重加密补发（只发给缺失者，绝不重复投递）；
-	// 缺失者已不在 roster → 标记失败；30s 超时 → 剩余者标记失败
+	// 缺失者已不在 roster → 标记失败；超时兜底 10 分钟且仅在线时判定——掉线重连
+	// 期间绝不把"待投递"标成失败（旧实现 30s 即判失败，一次长重连就丢消息）；
+	// 成员真正离开时由上面的名单比对/retarget 立即处置
 	// Flush + notify. Ready peers are re-encrypted and sent individually (only the
 	// missing ones, never duplicating delivered recipients); a missing peer no longer
-	// in the roster → failed; after 30s the remainder → failed
+	// in the roster → failed (unless migrated by uid). The timeout fallback is 10
+	// minutes and only judged while online — during our own reconnect nothing is ever
+	// marked failed (the old 30s rule lost messages on every long reconnect).
 	flushAndNotifyOutbox() {
 		if (!this.outbox.length) {
 			if (this.outboxTimer) {
@@ -1110,9 +1259,10 @@ class NodeCrypt {
 		const now = Date.now();
 		for (const entry of this.outbox) {
 			if (!entry.done && !(entry.failedFor && entry.failedFor.length) &&
-				entry.pending && entry.pending.length && now - entry.ts > 30000) {
-				// 超时：剩余未送达者标记失败
-				// Timeout: mark the remaining recipients failed
+				entry.pending && entry.pending.length && now - entry.ts > 600000 &&
+				this.isOpen() && this.serverShared) {
+				// 超时：剩余未送达者标记失败（仅在线时判定）
+				// Timeout: mark the remaining recipients failed (online only)
 				entry.failedFor = entry.pending.slice();
 				entry.pending = []
 			}

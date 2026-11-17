@@ -172,8 +172,11 @@ export function setupImageSend({
 	
 	if (attachBtn && fileInput) {
 		// Click attach triggers file input
-		// 点击附件按钮触发文件选择
-		on(attachBtn, 'click', () => fileInput.click());
+		// 点击附件按钮触发文件选择（原生对话框会短暂遮蔽页面：申请暂离抑制短窗）
+		on(attachBtn, 'click', () => {
+			try { window.dispatchEvent(new CustomEvent('nodecrypt-suppress-leave')) } catch (e) {}
+			fileInput.click()
+		});
 		
 		// Handle file input change
 		// 处理文件选择变化

@@ -32,6 +32,14 @@ export default {
       return stub.fetch(request);
     }
 
+    // 断线取证端点：转交 ChatRoom DO（连接/清理/alarm/驱逐计数）
+    // Idle-drop forensics endpoint: forwarded to the ChatRoom DO (connect/reap/alarm/eviction counters)
+    if (url.pathname === '/api/diag') {
+      const id = env.CHAT_ROOM.idFromName('chat-room');
+      const stub = env.CHAT_ROOM.get(id);
+      return stub.fetch(request);
+    }
+
     // 主动离开上报：页面销毁时 WS 消息可能来不及发出，sendBeacon 走这里转发进 DO
     // Explicit leave report: WS messages may not flush during page teardown; beacons come through here
     if (url.pathname === '/api/leave') {
@@ -82,20 +90,58 @@ export class ChatRoom {  constructor(state, env) {
     // processing can reorder deliveries (a key arriving after a later encrypted u)
     // and permanently wedge handshakes
     this.clientQueues = {};
-    
+
+    // 诊断：内存环形事件 + 计数（/api/diag 拉取），用于区分空闲断线的真因
+    // （DO 驱逐 / 服务端 reaping / 客户端自杀重连）
+    // Diagnostics: in-memory ring + counters (via /api/diag) to tell idle-drop causes
+    // apart (DO eviction / server-side reaping / client-initiated reconnects)
+    this.diag = {
+      ring: [],
+      counts: {
+        connects: 0,
+        closes: 0,
+        reaped: 0,
+        alarms: 0,
+        uidReplaced: 0,
+        notifySkipped: 0,
+        notifyPushed: 0
+      }
+    };
+    this.notifyAt = {}; // 频道级推送节流时间戳 / per-channel push throttle timestamps
+
     this.config = {
-      // 90s：后台标签定时器被节流到 ~1/min，60s 会把还活着的连接误清理
-      // 90s: background tabs throttle timers to ~1/min; 60s reaped live connections
-      seenTimeout: 90000,
+      // 180s：客户端心跳在后台标签/省电模式会被节流到分钟级，90s 会把还活着的
+      // 连接误清理并制造僵尸名单；被动断开的半开连接由 close 事件与 alarm 兜底
+      // 180s: client heartbeats are throttled to ~1/min in background tabs / power
+      // saving; 90s reaped live connections and polluted rosters with ghosts.
+      // Half-open sockets are bounded by close events and the periodic alarm.
+      seenTimeout: 180000,
       // 周期清理 alarm 间隔：不再依赖"有人新连接"才触发 cleanupOldConnections，
       // 旧连接的超时清理与成员变化广播由 alarm 兜底
       // Periodic-cleanup alarm interval: cleanup no longer depends on new connections
       cleanupInterval: 15000,
+      // 同频道离线推送最小间隔：逐帧推送会造成轰炸 + DO 串行队列堵塞
+      // Min interval between offline pushes per channel: per-frame pushes caused
+      // notification storms and stalled the DO serial queue
+      notifyThrottle: 20000,
       debug: false
     };
-    
+
     // Initialize RSA key pair
     this.initRSAKeyPair();
+  }
+
+  // 记录一条诊断事件（内存环形，最多 60 条）
+  // Append a diagnostic event (in-memory ring, max 60)
+  noteDiag(event, detail) {
+    const ring = this.diag.ring;
+    ring.push({ ts: Date.now(), event: event, detail: detail === undefined ? null : detail });
+    if (ring.length > 60) {
+      ring.splice(0, ring.length - 60);
+    }
+    if (this.diag.counts[event] !== undefined) {
+      this.diag.counts[event] += 1;
+    }
   }
 
   async initRSAKeyPair() {
@@ -167,6 +213,32 @@ export class ChatRoom {  constructor(state, env) {
 
   async fetch(request) {
     const url = new URL(request.url);
+
+    // 诊断端点：内存环形事件 + 计数 + DO 实例启动次数（持久化）
+    // → 空闲断线取证：doStarts 持续增长且 clients:0 ⇒ DO 被驱逐/重置；
+    //   reaped 增长 ⇒ 服务端 reaping；两者都不动 ⇒ 客户端自杀重连
+    // Diagnostics endpoint: in-memory ring + counters + DO instance starts (persisted)
+    // → idle-drop forensics: growing doStarts with clients:0 ⇒ DO eviction/reset;
+    //   growing reaped ⇒ server-side reaping; neither ⇒ client-initiated reconnect
+    if (url.pathname === '/api/diag') {
+      try {
+        if (!this.doStartsCounted) {
+          this.doStartsCounted = true;
+          const starts = ((await this.state.storage.get('diag:do-starts')) || 0) + 1;
+          await this.state.storage.put('diag:do-starts', starts);
+          this.doStarts = starts;
+        }
+        return new Response(JSON.stringify({
+          doStarts: this.doStarts || ((await this.state.storage.get('diag:do-starts')) || 0),
+          counts: this.diag.counts,
+          clients: Object.keys(this.clients).length,
+          channels: Object.keys(this.channels).length,
+          events: this.diag.ring
+        }, null, 2), { headers: { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' } });
+      } catch (error) {
+        return new Response(JSON.stringify({ error: String(error && error.message || error) }), { status: 500, headers: { 'Content-Type': 'application/json' } });
+      }
+    }
 
     // 主动离开端点：sendBeacon / APP 原生桥的 HTTP 兜底（WS q 之外的第二通道，幂等）
     // Explicit leave endpoint: HTTP fallback for sendBeacon / native APP bridge (second channel
@@ -271,12 +343,14 @@ export class ChatRoom {  constructor(state, env) {
     }
 
     logEvent('connection', clientId, 'debug');    // Store client information
+    this.noteDiag('connects', clientId);
     this.clients[clientId] = {
       connection: connection,
       seen: getTime(),
       key: null,
       shared: null,
-      channel: null
+      channel: null,
+      uid: null
     };
 
     // 新连接确保周期清理 alarm 在位（空转时由 cleanup 取消）
@@ -307,7 +381,7 @@ export class ChatRoom {  constructor(state, env) {
         this.sendMessage(connection, 'pong');
         return;
       }
-      logEvent('message', [clientId, message], 'debug');      // Handle key exchange
+      logEvent('message', [clientId, message.length], 'debug');      // Handle key exchange
       if (!this.clients[clientId].shared && message.length < 2048) {
         try {
           // Generate ECDH key pair using P-384 curve (equivalent to secp384r1)
@@ -378,7 +452,11 @@ export class ChatRoom {  constructor(state, env) {
       }
     });    // Handle connection close
     connection.addEventListener('close', async (event) => {
-      logEvent('close', [clientId, event], 'debug');
+      logEvent('close', [clientId, event && event.code, event && event.wasClean], 'debug');
+      // 断线取证：close code/是否主动（wasClean）是区分"服务端杀"与"客户端走"的关键
+      // Idle-drop forensics: close code / wasClean distinguishes server-side kills
+      // from client-initiated disconnects
+      this.noteDiag('closes', [clientId, event ? event.code : null, event ? event.wasClean : null]);
 
       // 异常断线（没有主动离开信号）：摘除成员并广播不带 x 标记的名单
       // → 客户端按 45s 延迟判定提示"离开"，期间同名重连则静默取消
@@ -448,7 +526,14 @@ export class ChatRoom {  constructor(state, env) {
     try {
       decrypted = decryptMessage(message, this.clients[clientId].shared);
 
-      logEvent('message-decrypted', [clientId, decrypted], 'debug');
+      // 只记动作/标记/成员数/长度，绝不打印整卷密文（几百 KB×成员数的日志会拖垮 DO）
+      // Log action/flag/member-count/length only; never dump full ciphertext payloads
+      logEvent('message-decrypted', [clientId, {
+        a: decrypted ? decrypted.a : null,
+        n: decrypted ? decrypted.n : null,
+        members: decrypted && isObject(decrypted.p) ? Object.keys(decrypted.p).length : null,
+        len: message.length
+      }], 'debug');
 
       if (!isObject(decrypted) || !isString(decrypted.a)) {
         return;
@@ -485,11 +570,60 @@ export class ChatRoom {  constructor(state, env) {
     try {
       const channel = decrypted.p;
 
-      this.clients[clientId].channel = channel;
+      // 同身份去重：同一 (频道, uid) 的旧连接被新连接顶替。uid = sha256(密码哈希+频道+用户名)
+      // 由客户端在加入时上报（密码永不上送，服务端无法反推），同名重连/同名多设备
+      // 不再产生幽灵成员，任何时刻名单人数 = 服务端名单人数，三端一致。
+      // Same-identity dedupe: a new connection replaces the older one with the same
+      // (channel, uid). uid = sha256(password-hash + channel + username), reported by
+      // the client at join (the password itself is never sent, so the server cannot
+      // reverse it). Same-name reconnects / multi-device joins no longer leave ghost
+      // members; roster size equals the server roster at any moment on all terminals.
+      const uid = isString(decrypted.uid) && decrypted.uid.length <= 64 ? decrypted.uid : null;
+      if (uid) {
+        const replacedIds = [];
+        for (const otherId in this.clients) {
+          const other = this.clients[otherId];
+          if (otherId !== clientId && other.uid === uid && other.channel === channel) {
+            replacedIds.push(otherId);
+          }
+        }
+        for (const oldId of replacedIds) {
+          const oldClient = this.clients[oldId];
+          const oldChannel = oldClient ? oldClient.channel : null;
+          // 先同步摘出成员表，旧连接的 close 事件查不到 client 会自然跳过
+          // Splice from the roster first; the stale close handler finds no client and no-ops
+          if (oldChannel && this.channels[oldChannel]) {
+            const remaining = this.channels[oldChannel].filter((id) => id !== oldId);
+            if (remaining.length === 0) {
+              delete this.channels[oldChannel];
+            } else if (remaining.length !== this.channels[oldChannel].length) {
+              this.channels[oldChannel] = remaining;
+            }
+          }
+          delete this.clients[oldId];
+          delete this.clientQueues[oldId];
+          if (oldClient && oldClient.connection) {
+            try {
+              oldClient.connection.close();
+            } catch (error) {
+              logEvent('uid-replace-close', [oldId, error], 'error');
+            }
+          }
+          this.noteDiag('uidReplaced', [oldId, clientId]);
+          logEvent('uid-replace', [oldId, clientId], 'info');
+        }
+      }
 
+      this.clients[clientId].channel = channel;
+      if (uid) {
+        this.clients[clientId].uid = uid;
+      }
+
+      // 双重保险：同一 clientId 重复 join 不产生重复成员
+      // Double safety: a duplicate join of the same clientId never duplicates membership
       if (!this.channels[channel]) {
         this.channels[channel] = [clientId];
-      } else {
+      } else if (this.channels[channel].indexOf(clientId) < 0) {
         this.channels[channel].push(clientId);
       }
 
@@ -551,9 +685,9 @@ export class ChatRoom {  constructor(state, env) {
           return;
         }
 
-        // 私聊消息转发后，对本频道离线注册设备触发通知（不包含任何明文）
-        // After relaying a private message, notify offline registered devices of the channel (no plaintext)
-        await notifyOfflineDevices(this.env, this.state.storage, channel, 'private');
+        // 私聊消息转发后，对本频道离线注册设备触发通知（不包含任何明文；20s 节流）
+        // After relaying a private message, notify offline devices (no plaintext; 20s throttle)
+        await this.notifyChannelOffline(channel, 'private');
       }
 
     } catch (error) {
@@ -592,9 +726,9 @@ export class ChatRoom {  constructor(state, env) {
         return;
       }
 
-      // 房间消息转发后，对本频道离线注册设备触发通知（不包含任何明文）
-      // After relaying a channel message, notify offline registered devices of the channel (no plaintext)
-      await notifyOfflineDevices(this.env, this.state.storage, channel, 'channel');
+      // 房间消息转发后，对本频道离线注册设备触发通知（不包含任何明文；20s 节流）
+      // After relaying a channel message, notify offline devices (no plaintext; 20s throttle)
+      await this.notifyChannelOffline(channel, 'channel');
 
     } catch (error) {
       logEvent('message-channel', [clientId, error], 'error');
@@ -609,11 +743,17 @@ export class ChatRoom {  constructor(state, env) {
   broadcastMemberList(channel, explicitLeftIds) {
     try {
       const members = this.channels[channel];
+      if (!members) {
+        return;
+      }
 
       for (const member of members) {
         const client = this.clients[member];
 
-        if (this.isClientInChannel(client, channel)) {
+        if (!this.isClientInChannel(client, channel)) {
+          continue;
+        }
+        try {
           const messageObj = {
             a: 'l',
             i: member,
@@ -624,17 +764,58 @@ export class ChatRoom {  constructor(state, env) {
           if (explicitLeftIds && explicitLeftIds.length) {
             messageObj.x = explicitLeftIds;
           }
+          // 附带成员身份映射（uid）：客户端据此合并同名重连、迁移待投递目标
+          // Member identity map (uid): clients merge same-name reconnects and
+          // retarget pending outbox deliveries through it
+          const uidMap = {};
+          let hasUid = false;
+          for (const id of messageObj.p) {
+            const entry = this.clients[id];
+            if (entry && entry.uid) {
+              uidMap[id] = entry.uid;
+              hasUid = true;
+            }
+          }
+          if (hasUid) {
+            messageObj.u = uidMap;
+          }
 
           const encrypted = encryptMessage(messageObj, client.shared);
           this.sendMessage(client.connection, encrypted);
-
-          messageObj.p = null;
+        } catch (error) {
+          // 单个成员失败只跳过该成员，绝不中断其余成员的名单下发
+          // One failing member is skipped; never abort the roster for the others
+          logEvent('broadcast-member-list', [member, error], 'error');
         }
       }
     } catch (error) {
       logEvent('broadcast-member-list', error, 'error');
     }
-  }  // Check if client is in channel
+  }  // 频道级离线推送节流：逐帧推送曾造成通知轰炸 + DO 串行队列堵塞（文件传输卡死的
+  // 根因之一）。20s 内的后续消息只转发不推送；是否真的有离线设备由 push 层判定。
+  // Per-channel offline-push throttle: per-frame pushes caused notification storms
+  // and stalled the DO serial queue (a root cause of mid-transfer stalls). Within
+  // 20s the relay-only path is taken; the offline-device check stays in push.js.
+  async notifyChannelOffline(channel, source) {
+    const now = getTime();
+    if (now - (this.notifyAt[channel] || 0) < this.config.notifyThrottle) {
+      this.noteDiag('notifySkipped', source);
+      return;
+    }
+    this.notifyAt[channel] = now;
+    try {
+      const status = await notifyOfflineDevices(this.env, this.state.storage, channel, source);
+      if (status === 'pushed') {
+        this.noteDiag('notifyPushed', source);
+      } else {
+        this.noteDiag('notifySkipped', source + ':' + status);
+      }
+    } catch (error) {
+      logEvent('notify-channel-offline', [channel, error], 'error');
+      this.noteDiag('notifySkipped', source + ':error');
+    }
+  }
+  // Check if client is in channel
   isClientInChannel(client, channel) {
     return (
       client &&
@@ -684,6 +865,9 @@ export class ChatRoom {  constructor(state, env) {
     for (const clientId of clientsToRemove) {
       try {
         logEvent('connection-seen', clientId, 'debug');
+        // 断线取证：reap 携带 seen 空窗秒数，便于区分"节流中的活连接被误杀"
+        // Idle-drop forensics: the seen gap tells throttled-but-alive connections apart
+        this.noteDiag('reaped', [clientId, Math.round((getTime() - this.clients[clientId].seen) / 1000) + 's']);
         // close 时 clients 已被删除，这里统一补齐设备离线标记
         // close event won't find the client anymore, so mark push devices offline here
         const removed = this.clients[clientId];
@@ -743,12 +927,17 @@ export class ChatRoom {  constructor(state, env) {
       }
     }
 
-    // 仍有客户端 → 续约周期清理 alarm；全部清空 → 取消 alarm 让 DO 真正空闲
-    // Clients remain → renew the periodic cleanup alarm; empty → cancel it so the DO can idle
+    // 仍有客户端 → 无条件续约周期清理 alarm；全部清空 → 取消 alarm 让 DO 真正空闲。
+    // 旧实现只在"本次有清理"时重排：alarm 空跑一次后周期清理静默停止，
+    // 僵尸连接与名单重播都失去兜底，单向"同步中"从此无人修复。
+    // Clients remain → always renew the periodic cleanup alarm; empty → cancel it so
+    // the DO can idle. The old code only rescheduled when something was reaped, so a
+    // single idle pass silently stopped periodic cleanup — ghost members and one-sided
+    // "syncing" states then had no fallback to recover from.
     try {
       if (Object.keys(this.clients).length === 0) {
         await this.state.storage.deleteAlarm();
-      } else if (clientsToRemove.length > 0) {
+      } else {
         await this.scheduleCleanupAlarm();
       }
     } catch (error) {
@@ -777,6 +966,7 @@ export class ChatRoom {  constructor(state, env) {
   // handshakes
   async alarm() {
     try {
+      this.noteDiag('alarms');
       await this.cleanupOldConnections();
       // 名单重播（所有非空频道）：客户端人数以此保持三端一致
       // Roster rebroadcast (all non-empty channels): keeps member counts consistent

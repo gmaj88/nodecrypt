@@ -417,26 +417,32 @@ export async function removeDevice(storage, channelHash, cid) {
 		return false;
 	}
 }
-
 // 推送通知（不 await 结果也安全；由 DO 的 await 链路保证调度）
 // Send push notifications (safe fire-and-forget; scheduled via DO await chain)
 // source: 调用来源（'private'=私聊转发 / 'channel'=频道消息转发），仅用于日志归因
 // source: call origin ('private' / 'channel'), used only for log attribution
+// 返回状态：'pushed' / 'no-devices' / 'auth-failed' / 'not-configured' / 'error'
+// Returns a status: 'pushed' / 'no-devices' / 'auth-failed' / 'not-configured' / 'error'
 export async function notifyOfflineDevices(env, storage, channelHash, source) {
 	if (!isConfigured(env)) {
-		return;
+		return 'not-configured';
 	}
 	const sourceLabel = source || 'unknown';
+
 	try {
 		const tokens = await listOfflineDevices(storage, channelHash);
 		if (tokens.length === 0) {
-			await appendNotifyLog(storage, channelHash, { source: sourceLabel, skip: 'no-offline-devices' });
-			return;
+			// 无离线设备：不再写通知日志 —— 原实现每条消息一次同 key get+put，
+			// 文件逐帧传输时把 DO 串行队列拖死（传输卡死 + 断线的根因之一）。
+			// No offline devices: skip the storage write entirely — the old per-message
+			// get+put on the same key used to stall the DO serial queue during bulk
+			// file relays (a root cause of mid-transfer stalls).
+			return 'no-devices';
 		}
 		const token = await getGetuiToken(env, storage);
 		if (!token) {
 			await appendNotifyLog(storage, channelHash, { source: sourceLabel, skip: 'auth-failed', devices: tokens });
-			return;
+			return 'auth-failed';
 		}
 		const results = [];
 		for (const cid of tokens) {
@@ -464,9 +470,11 @@ export async function notifyOfflineDevices(env, storage, channelHash, source) {
 			}
 		}
 		await appendNotifyLog(storage, channelHash, { source: sourceLabel, devices: tokens.length, results });
+		return 'pushed';
 	} catch (error) {
 		console.error('notifyOfflineDevices error', error);
 		await appendNotifyLog(storage, channelHash, { source: sourceLabel, error: String(error && error.message || error) });
+		return 'error';
 	}
 }
 

@@ -186,8 +186,11 @@ function setupModalEvents() {
 	on(closeBtn, 'click', hideUploadModal);
 	on(cancelBtn, 'click', hideUploadModal);
 
-	// Browse files
-	on(browseBtn, 'click', () => fileInput.click());
+	// Browse files（原生对话框会短暂遮蔽页面：申请暂离抑制短窗）
+	on(browseBtn, 'click', () => {
+		try { window.dispatchEvent(new CustomEvent('nodecrypt-suppress-leave')) } catch (e) {}
+		fileInput.click()
+	});
 	on(fileInput, 'change', handleFileInputChange);
 
 	// Drag and drop
