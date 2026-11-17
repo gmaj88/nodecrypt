@@ -105,7 +105,8 @@ export class ChatRoom {  constructor(state, env) {
         heartbeats: 0,
         uidReplaced: 0,
         notifySkipped: 0,
-        notifyPushed: 0
+        notifyPushed: 0,
+        relayDropped: 0
       }
     };
     this.notifyAt = {}; // 频道级推送节流时间戳 / per-channel push throttle timestamps
@@ -237,6 +238,21 @@ export class ChatRoom {  constructor(state, env) {
           doStarts: this.doStarts || ((await this.state.storage.get('diag:do-starts')) || 0),
           counts: this.diag.counts,
           clients: Object.keys(this.clients).length,
+          // 每个连接的详情：id / uid 前 8 位 / 服务端握手（shared）是否完成 /
+          // 频道 / 多久没活动——配合成员"正在加入"定位是哪个端卡住、卡在哪一步
+          // Per-connection details: id / first 8 of uid / whether the server-side
+          // handshake (shared) completed / channel / idle time — pairs with the
+          // member "joining" view to pinpoint which terminal is stuck and where
+          clientDetails: Object.keys(this.clients).map((id) => {
+            const c = this.clients[id];
+            return {
+              id: id,
+              uid: c.uid ? c.uid.slice(0, 8) : null,
+              shared: c.shared ? true : false,
+              channel: c.channel ? c.channel.slice(0, 8) : null,
+              seenAgoMs: c.seen ? (Date.now() - c.seen) : null
+            };
+          }),
           channels: Object.keys(this.channels).length,
           events: this.diag.ring
         }, null, 2), { headers: { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' } });
@@ -685,7 +701,6 @@ export class ChatRoom {  constructor(state, env) {
           a: 'c',
           p: decrypted.p,
           c: clientId
-        };
         // 握手自愈标记透传：k:1 = "我缺少你的公钥，请重发"（客户端协议，见 NodeCrypt）
         // Pass through the handshake-heal flag: k:1 = "I lack your public key, resend"
         if (decrypted.k === 1) {
@@ -709,6 +724,13 @@ export class ChatRoom {  constructor(state, env) {
         // 私聊消息转发后，对本频道离线注册设备触发通知（不包含任何明文；20s 节流）
         // After relaying a private message, notify offline devices (no plaintext; 20s throttle)
         await this.notifyChannelOffline(channel, 'private');
+      } else {
+        // 目标成员不在线/未入频道/未握手：定向中继静默丢弃。握手回复正走这条
+        // 路——计数让"对方密钥发来但回复丢在这里"可见
+        // Target offline/not-in-channel/no-shared: the targeted relay drops silently.
+        // Handshake replies travel this path — counting makes "peer key arrived but
+        // the reply was dropped here" visible
+        this.noteDiag('relayDropped', ['c', clientId, decrypted.c]);
       }
 
     } catch (error) {
@@ -723,10 +745,23 @@ export class ChatRoom {  constructor(state, env) {
     try {
       const channel = this.clients[clientId].channel;
       // 过滤有效的目标成员
+      const invalidMembers = [];
       const validMembers = Object.keys(decrypted.p).filter(member => {
         const targetClient = this.clients[member];
-        return isString(decrypted.p[member]) && this.isClientInChannel(targetClient, channel);
+        const ok = isString(decrypted.p[member]) && this.isClientInChannel(targetClient, channel);
+        if (!ok) {
+          invalidMembers.push(member);
+        }
+        return ok;
       });
+      // 频道广播的无效目标：计数 + 记录（进房公钥广播走 'w'，成员未握手/
+      // 已被顶替时它的密钥会丢在这里——"正在加入"卡死的候选真因）
+      // Invalid targets of a channel broadcast: count + record. The join key
+      // broadcast travels 'w'; keys dropped here for not-yet-handshaked / replaced
+      // members are a prime suspect for stuck "joining" states
+      if (invalidMembers.length) {
+        this.noteDiag('relayDropped', ['w', clientId, invalidMembers.length]);
+      }
 
       // 处理所有有效的目标成员
       for (const member of validMembers) {
