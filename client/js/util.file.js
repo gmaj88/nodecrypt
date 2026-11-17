@@ -496,7 +496,7 @@ async function sendVolumes(fileId, volumes, onSend, updateProgress, fileName) {
 	if (!fileTransfer) return;
 
 	let currentVolume = 0;
-	const batchSize = 5; // 每批发送5个分卷
+	const batchSize = 3; // 每批发送3个分卷（与 APP 端一致：约1.6MB/s，避免突发压垮中继/触发逐帧推送）
 	let aborted = false;
 
 	// 中止：标记失败态 + 系统提示（接收方不会再收到后续卷，早停比静默截断诚实）
@@ -560,8 +560,8 @@ async function sendVolumes(fileId, volumes, onSend, updateProgress, fileName) {
 
 		currentVolume = batchEnd;
 
-		// 继续发送下一批，使用较短的延迟
-		setTimeout(sendNextBatch, 100);
+		// 继续发送下一批（150ms 节流，对齐 APP 的稳态节奏）
+		setTimeout(sendNextBatch, 150);
 	}
 
 	// 开始发送
@@ -639,6 +639,18 @@ function updateFileProgress(fileId) {
 						}, 550);
 					}, 200);
 				}
+			}
+		} else if (transfer.status === 'failed') {
+			// 中止/取消：状态文字更新（系统消息里有具体原因），进度条归零不再卡在 Sending x/y
+			if (progressContainer) {
+				progressContainer.style.display = 'block';
+				progressContainer.classList.remove('fade-out');
+			}
+			if (progressBar) progressBar.style.width = '0%';
+			if (statusText) statusText.textContent = isSender ? '发送已取消 / Send cancelled' : '接收中断 / Transfer failed';
+			if (downloadBtn) {
+				downloadBtn.classList.remove('show', 'animate-in');
+				downloadBtn.style.display = 'none';
 			}
 		}
 	});
