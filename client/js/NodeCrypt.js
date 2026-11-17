@@ -822,10 +822,19 @@ class NodeCrypt {
 		}, this.config.pingInterval)
 	}
 
-	// 主动断开以触发既有 onclose→3s 重连路径；close 失败时回退到 disconnect
-	// Force-close to trigger the existing onclose→3s reconnect path; fall back to disconnect
+	// 主动断开以触发既有 onclose→3s 重连路径；close 失败时回退到 disconnect。
+	// 先发 bye:why 让服务端 diag 知道这次 close 是哪条路径触发（纯文本帧，
+	// 与 'ping' 同通道，无需加密；服务端把它记入 close 事件的原因位）
+	// Force-close to trigger the existing onclose→3s reconnect path; fall back to
+	// disconnect. Send bye:why first so the server diag knows which path closed the
+	// socket (plain-text frame, same channel as 'ping', recorded into the close event)
 	forceReconnect(why) {
 		this.logEvent('forceReconnect', why, 'warn');
+		try {
+			this.sendMessage('bye:' + why)
+		} catch (error) {
+			this.logEvent('bye-send', error, 'debug')
+		}
 		try {
 			this.connection.close()
 		} catch (error) {

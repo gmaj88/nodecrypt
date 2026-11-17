@@ -102,12 +102,17 @@ export class ChatRoom {  constructor(state, env) {
         closes: 0,
         reaped: 0,
         alarms: 0,
+        heartbeats: 0,
         uidReplaced: 0,
         notifySkipped: 0,
         notifyPushed: 0
       }
     };
     this.notifyAt = {}; // 频道级推送节流时间戳 / per-channel push throttle timestamps
+    // 客户端上报的断线原因（bye:why）与服务端主动杀连接的标记，close 事件并入 detail
+    // Client-reported close reasons (bye:why) and server-side kill tags, merged into
+    // the close event detail
+    this.closeReasons = {};
 
     this.config = {
       // 180s：客户端心跳在后台标签/省电模式会被节流到分钟级，90s 会把还活着的
@@ -381,6 +386,16 @@ export class ChatRoom {  constructor(state, env) {
         this.sendMessage(connection, 'pong');
         return;
       }
+      // 客户端自杀重连前的告别帧（bye:ping-watchdog / bye:lifecycle-probe）：
+      // 原因并入随后的 close 事件，diag 一眼看出断线路径
+      // Farewell frame before a client-initiated reconnect (bye:ping-watchdog /
+      // bye:lifecycle-probe): the reason is merged into the close event so the diag
+      // shows which path closed the socket
+      if (message.startsWith('bye:')) {
+        this.closeReasons[clientId] = message.slice(4) || 'client-bye';
+        this.clients[clientId].seen = getTime();
+        return;
+      }
       logEvent('message', [clientId, message.length], 'debug');      // Handle key exchange
       if (!this.clients[clientId].shared && message.length < 2048) {
         try {
@@ -437,6 +452,7 @@ export class ChatRoom {  constructor(state, env) {
 
         } catch (error) {
           logEvent('message-key', [clientId, error], 'error');
+          this.closeReasons[clientId] = 'key-error';
           this.closeConnection(connection);
         }
 
@@ -453,10 +469,13 @@ export class ChatRoom {  constructor(state, env) {
     });    // Handle connection close
     connection.addEventListener('close', async (event) => {
       logEvent('close', [clientId, event && event.code, event && event.wasClean], 'debug');
-      // 断线取证：close code/是否主动（wasClean）是区分"服务端杀"与"客户端走"的关键
-      // Idle-drop forensics: close code / wasClean distinguishes server-side kills
-      // from client-initiated disconnects
-      this.noteDiag('closes', [clientId, event ? event.code : null, event ? event.wasClean : null]);
+      // 断线取证：close code/是否主动（wasClean）+ 断线原因（客户端 bye 上报或
+      // 服务端主动杀标记）是区分"服务端杀"与"客户端走"的关键
+      // Idle-drop forensics: close code / wasClean + reason (client bye report or
+      // server-side kill tag) distinguishes server-side kills from client exits
+      const closeReason = this.closeReasons[clientId] || null;
+      delete(this.closeReasons[clientId]);
+      this.noteDiag('closes', [clientId, event ? event.code : null, event ? event.wasClean : null, closeReason]);
 
       // 异常断线（没有主动离开信号）：摘除成员并广播不带 x 标记的名单
       // → 客户端按 45s 延迟判定提示"离开"，期间同名重连则静默取消
@@ -512,6 +531,7 @@ export class ChatRoom {  constructor(state, env) {
     }
 
     if (explicit && clientInfo.connection) {
+      this.closeReasons[clientId] = this.closeReasons[clientId] || 'explicit-leave';
       try {
         clientInfo.connection.close();
       } catch (error) {
@@ -603,6 +623,7 @@ export class ChatRoom {  constructor(state, env) {
           delete this.clients[oldId];
           delete this.clientQueues[oldId];
           if (oldClient && oldClient.connection) {
+            this.closeReasons[oldId] = 'uid-replace';
             try {
               oldClient.connection.close();
             } catch (error) {
@@ -894,6 +915,7 @@ export class ChatRoom {  constructor(state, env) {
           }
         }
         if (removed && removed.connection) {
+          this.closeReasons[clientId] = 'seen-timeout';
           try {
             removed.connection.close();
           } catch (error) {
@@ -973,6 +995,22 @@ export class ChatRoom {  constructor(state, env) {
       for (const channel of Object.keys(this.channels)) {
         this.broadcastMemberList(channel);
       }
+      // 服务端心跳：给每个连接推一帧 'pong'。客户端把任意入站帧当活证刷新
+      // lastPongAt（零客户端改动），后台页即使定时器被系统节流到分钟级，
+      // 看门狗也不会再把活连接误判成半开而自杀重连；Cloudflare ~100s 空闲
+      // 回收窗口也被这帧流量彻底喂饱。
+      // Server-side heartbeat: push one 'pong' frame per connection. Clients treat
+      // any inbound frame as proof of life and refresh lastPongAt (zero client
+      // changes), so background pages with timer throttling at ~1/min no longer get
+      // misjudged as half-open by their own watchdog; Cloudflare's ~100s idle
+      // WebSocket window is fed as well.
+      for (const clientId of Object.keys(this.clients)) {
+        const clientInfo = this.clients[clientId];
+        if (clientInfo && clientInfo.connection) {
+          this.sendMessage(clientInfo.connection, 'pong');
+        }
+      }
+      this.noteDiag('heartbeats');
     } catch (error) {
       logEvent('alarm-cleanup', error, 'error');
     }
