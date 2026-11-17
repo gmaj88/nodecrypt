@@ -492,9 +492,20 @@ function playSoundNotification() {
 }
 
 // Show desktop notification
-// 显示桌面通知
+// 显示桌面通知。
+// 治理：页面可见时不打扰用户；同一房间 60s 最多 1 条（此前每条消息都 new
+// Notification，聊天密集时通知栏轰炸 —— "离线时一堆推送"的主要来源之一）。
+// Governance: stay quiet while the page is visible; at most one notification per
+// room per 60s. (Previously every single message created a Notification — the main
+// source of the "pile of notifications" while away.)
+const NOTIFY_THROTTLE_MS = 60000;
+const notifyAt = {};
 function showDesktopNotification(roomName, text, msgType, sender) {
 	if (!('Notification' in window) || Notification.permission !== 'granted') return;
+	if (document.visibilityState === 'visible') return;
+	const now = Date.now();
+	if (now - (notifyAt[roomName] || 0) < NOTIFY_THROTTLE_MS) return;
+	notifyAt[roomName] = now;
 	let body;
 	const senderPrefix = sender ? `${sender}:` : '';	if (msgType === 'image' || msgType === 'private image') {
 		body = `${senderPrefix}${t('notification.image', '[image]')}`;

@@ -389,25 +389,36 @@ window.addEventListener('DOMContentLoaded', () => {
 				if (rd.privateChatTargetId) {
 					// 私聊文件发送（按人投递：对方未就绪时排队补发）
 					// Private file send (per-recipient: queued and flushed when ready)
-					const status = rd.chat.sendPrivateMessage(rd.privateChatTargetId, msgWithUser.type + '_private', msgWithUser);
-					
+					// 分卷帧 noQueue：outbox 上限会静默丢卷，未就绪时返回 aborted 由发送方中止
+					const noQueue = msgWithUser.type === 'file_volume' || msgWithUser.type === 'file_complete';
+					const status = rd.chat.sendPrivateMessage(rd.privateChatTargetId, msgWithUser.type + '_private', msgWithUser, noQueue ? { noQueue: true } : undefined);
+
 					// 添加到自己的聊天记录
 					if (msgWithUser.type === 'file_start') {
 						const bubble = addMsg(msgWithUser, false, 'file_private');
 						if (status.queued) attachOutboxStatus(bubble, status.mid, status.offline)
 					}
+					return status
 				} else {
 					// 公共频道文件发送（已就绪成员立即收到，未就绪者排队补发）
 					// Send file to public channel (ready peers now, the rest queued)
-					const status = rd.chat.sendChannelMessage(msgWithUser.type, msgWithUser);
-					
+					// file_volume/file_complete 带 n:0 + noQueue：整文件只推 1 条（file_start），
+					// 中间帧绝不静默排队（outbox 上限会丢卷，导致接收方永远等不齐）
+					// Volume/complete frames carry n:0 + noQueue: exactly one push per file
+					// (file_start) and no silent queueing that would drop volumes
+					const noQueue = msgWithUser.type === 'file_volume' || msgWithUser.type === 'file_complete';
+					const status = rd.chat.sendChannelMessage(msgWithUser.type, msgWithUser, noQueue ? { n: 0, noQueue: true } : undefined);
+
 					// 添加到自己的聊天记录
 					if (msgWithUser.type === 'file_start') {
 						const bubble = addMsg(msgWithUser, false, 'file');
 						if (status.queued) attachOutboxStatus(bubble, status.mid, status.offline)
 					}
+					return status
 				}
-			}		}
+			}
+			return null
+		}
 	});
 
 

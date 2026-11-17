@@ -483,32 +483,57 @@ async function handleFilesUpload(files, onSend) {
 }
 
 // Send volumes with progress tracking
-// 发送分卷并跟踪进度
+// 发送分卷并跟踪进度。
+// 背压：onSend 返回 aborted/false 说明有成员未就绪或加密失败 —— 立即中止并提示，
+// 绝不静默丢卷（旧实现把卷丢进 outbox，50 条上限会静默丢弃最旧的卷，
+// 接收端永远等不齐、进度条卡死）。
+// Backpressure: onSend returning aborted/false means a member is not ready or
+// encryption failed — abort immediately with a notice; never silently drop volumes
+// (the old code queued them into an outbox whose 50-entry cap dropped the oldest,
+// leaving receivers waiting forever with a stuck progress bar).
 async function sendVolumes(fileId, volumes, onSend, updateProgress, fileName) {
 	const fileTransfer = window.fileTransfers.get(fileId);
 	if (!fileTransfer) return;
-	
+
 	let currentVolume = 0;
 	const batchSize = 5; // 每批发送5个分卷
-	
+	let aborted = false;
+
+	// 中止：标记失败态 + 系统提示（接收方不会再收到后续卷，早停比静默截断诚实）
+	// Abort: mark failed + system notice (receivers get no further volumes; failing
+	// early is more honest than a silent truncation)
+	function abortTransfer(reason) {
+		aborted = true;
+		fileTransfer.status = 'failed';
+		updateFileProgress(fileId);
+		if (window.addSystemMsg) {
+			window.addSystemMsg(`文件「${fileName}」发送已取消：${reason}`);
+		}
+	}
+
 	function sendNextBatch() {
+		if (aborted) return;
 		if (currentVolume >= volumes.length) {
 			// 发送完成消息
-			onSend({
+			const completeResult = onSend({
 				type: 'file_complete',
 				fileId
 			});
-			
+			if (!completeResult || completeResult === false || completeResult.aborted) {
+				abortTransfer('有成员尚未就绪，已取消发送');
+				return;
+			}
+
 			fileTransfer.status = 'completed';
 			updateFileProgress(fileId);
 			updateProgress(`✓ Sent ${fileName} successfully`);
 			return;
 		}
-		
+
 		// 发送当前批次
 		const batchEnd = Math.min(currentVolume + batchSize, volumes.length);
 		const batch = [];
-		
+
 		for (let i = currentVolume; i < batchEnd; i++) {
 			batch.push({
 				type: 'file_volume',
@@ -518,20 +543,27 @@ async function sendVolumes(fileId, volumes, onSend, updateProgress, fileName) {
 				isLast: i === volumes.length - 1
 			});
 		}
-		
-		// 发送批次中的所有分卷
-		batch.forEach(volumeMsg => onSend(volumeMsg));
-		
+
+		// 发送批次中的所有分卷；任一卷被拒（未就绪/失败）即中止整条传输
+		// Send all volumes of the batch; any rejected volume aborts the transfer
+		for (const volumeMsg of batch) {
+			const result = onSend(volumeMsg);
+			if (!result || result === false || result.aborted) {
+				abortTransfer(result && result.missing > 0 ? '有成员尚未就绪，已取消发送' : '发送失败，请稍后重试');
+				return;
+			}
+		}
+
 		// 更新发送进度
 		fileTransfer.sentVolumes = batchEnd;
 		updateFileProgress(fileId);
-		
+
 		currentVolume = batchEnd;
-		
+
 		// 继续发送下一批，使用较短的延迟
 		setTimeout(sendNextBatch, 100);
 	}
-	
+
 	// 开始发送
 	sendNextBatch();
 }

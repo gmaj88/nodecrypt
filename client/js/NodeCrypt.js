@@ -1344,18 +1344,26 @@ class NodeCrypt {
 	// Send a message to all channels
 	// 向所有频道发送消息
 	// 按人投递：已就绪成员立即发送；未就绪者进入发件箱，握手完成后自动补发。
-	// 语音信令（voice-*）不排队（实时性优先，过期信令无意义）。
+	// 语音信令（voice-*）不排队（实时性优先，过期信令无意义）且带 n:0（不触发推送）。
+	// opts.n / opts.noQueue：文件分卷帧用 noQueue=true（绝不静默排队，未就绪直接
+	// 返回 missing 由发送方中止）；文件中间帧 n=0（整文件只在 file_start 触发 1 次推送）。
 	// Per-recipient delivery: ready peers get the message now; unready ones go to the
 	// outbox and are flushed once their handshake completes. Voice signaling
-	// (voice-*) is never queued (realtime; stale signaling is meaningless).
-	sendChannelMessage(type, data) {
+	// (voice-*) is never queued (realtime; stale signaling is meaningless) and carries
+	// n:0 (no offline push). opts.noQueue is for file volume frames: never silently
+	// queued (the outbox cap would drop them); the sender aborts on missing members.
+	// Volume frames carry n=0 so a whole file triggers exactly one push (at file_start).
+	sendChannelMessage(type, data, opts) {
 		const rosterIds = Object.keys(this.channel);
 		const isVoice = this.isString(type) && type.indexOf('voice-') === 0;
+		const noQueue = !!(opts && opts.noQueue);
+		const nFlag = isVoice || (opts && opts.n === 0) ? 0 : null;
 		if (!this.serverShared || !this.isOpen()) {
-			if (isVoice) {
+			if (isVoice || noQueue) {
 				return {
 					queued: false,
-					failed: true,
+					failed: !isVoice,
+					aborted: noQueue,
 					delivered: 0,
 					total: rosterIds.length
 				}
@@ -1395,16 +1403,32 @@ class NodeCrypt {
 			// MUST send even with an empty payloads map (no online E2E peers): the server
 			// needs to learn "message happened in channel" to notify offline registered
 			// devices (killed / home-screen phones depend on exactly this path).
-			const payload = this.encryptServerMessage({
+			const wrapper = {
 				a: 'w',
 				p: payloads,
-			}, this.serverShared);
+			};
+			if (nFlag === 0) {
+				wrapper.n = 0
+			}
+			const payload = this.encryptServerMessage(wrapper, this.serverShared);
 			if (payload.length === 0 || payload.length > (8 * 1024 * 1024)) {
 				return (false)
 			}
 			this.connection.send(payload);
 			const delivered = Object.keys(payloads).length;
 			if (missing.length > 0 && !isVoice) {
+				if (noQueue) {
+					// 文件分卷：未就绪成员不排队（outbox 上限会静默丢卷），由发送方中止
+					// File volumes: never queued (the outbox cap silently drops them);
+					// the sender aborts when members are missing
+					return {
+						queued: false,
+						aborted: true,
+						delivered: delivered,
+						total: rosterIds.length,
+						missing: missing.length
+					}
+				}
 				// 部分成员未就绪（如"同步中"）：只为缺失者排队，就绪后单独补发
 				// Some peers not ready (e.g. still syncing): queue for the missing ones only
 				const outboxEntry = this.queueOutbox(type, data, missing, false, false);
@@ -1424,7 +1448,7 @@ class NodeCrypt {
 			}
 		} catch (error) {
 			this.logEvent('sendChannelMessage', error, 'error');
-			if (!isVoice) {
+			if (!isVoice && !noQueue) {
 				const entry = this.queueOutbox(type, data, null, true, false);
 				return {
 					mid: entry.mid,
@@ -1443,11 +1467,23 @@ class NodeCrypt {
 		}
 	}
 
-	// 定向私聊发送（替代 main.js 手工加密的旧路径），同样支持按人排队补发
+	// 定向私聊发送（替代 main.js 手工加密的旧路径），同样支持按人排队补发。
+	// opts.noQueue：文件分卷帧不排队（outbox 上限会静默丢卷），未就绪直接返回 aborted
 	// Targeted private send (replaces main.js manual encryption), with the same
-	// per-recipient outbox support
-	sendPrivateMessage(targetCid, type, data) {
+	// per-recipient outbox support. opts.noQueue: volume frames are never queued
+	// (the cap would silently drop them); not-ready returns aborted
+	sendPrivateMessage(targetCid, type, data, opts) {
+		const noQueue = !!(opts && opts.noQueue);
 		if (!this.serverShared || !this.isOpen()) {
+			if (noQueue) {
+				return {
+					queued: false,
+					failed: true,
+					aborted: true,
+					delivered: 0,
+					total: 1
+				}
+			}
 			const entry = this.queueOutbox(type, data, [targetCid], true, true);
 			return {
 				mid: entry.mid,
@@ -1476,6 +1512,16 @@ class NodeCrypt {
 				}
 			} catch (error) {
 				this.logEvent('sendPrivateMessage', error, 'error')
+			}
+		}
+		if (noQueue) {
+			// 对方未就绪：分卷绝不排队，由发送方中止
+			// Peer not ready: volumes are never queued; the sender aborts
+			return {
+				queued: false,
+				aborted: true,
+				delivered: 0,
+				total: 1
 			}
 		}
 		// 对方未就绪（同步中/握手未完成）：排队，就绪后定向补发

@@ -123,7 +123,7 @@ export class ChatRoom {  constructor(state, env) {
       // 同频道离线推送最小间隔：逐帧推送会造成轰炸 + DO 串行队列堵塞
       // Min interval between offline pushes per channel: per-frame pushes caused
       // notification storms and stalled the DO serial queue
-      notifyThrottle: 20000,
+      notifyThrottle: 60000, // 频道级推送节流 60s：离线期间密集聊天/文件分卷最多 1 条/分钟
       debug: false
     };
 
