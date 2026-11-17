@@ -471,14 +471,17 @@ class NodeCrypt {
 						logListResend += 1;
 						payloads[clientId] = entry.keys.getPublic('hex')
 					}
-					// 未握手检查：名单到来即重置退避（重启 20s 周期），保证收敛不再依赖运气
-					// Pending check resets its backoff on every roster so convergence never
-					// depends on luck
-					if (!entry.username) {
-						if (this.pendingPeerTimers[clientId]) {
-							clearTimeout(this.pendingPeerTimers[clientId]);
-							delete this.pendingPeerTimers[clientId]
-						}
+					// 未握手检查：仅在尚未挂定时器时补挂（保留既有退避计数）。
+					// 旧实现在每次名单到达时 clear+重挂 20s 定时器，而服务端每 15s
+					// 重播一次名单——重播永远赶在到期前把定时器重置，主动重发自愈
+					// 实际永不触发，收敛只能靠 120s 慢路径碰运气（"同步中"卡数分钟
+					// 的根因）。
+					// Only arm the pending check when none is running (keeps backoff
+					// attempt). The old code cleared and re-armed on every roster, but
+					// the server rebroadcasts every 15s — always before the 20s delay
+					// fired, so the proactive resend never ran and convergence fell
+					// back to luck (root cause of multi-minute "syncing" entries).
+					if (!entry.username && !this.pendingPeerTimers[clientId]) {
 						this.armPendingPeerCheck(clientId)
 					}
 				}
@@ -946,20 +949,20 @@ class NodeCrypt {
 		this.pendingPeerTimers = {}
 	}
 
-	// 某 peer 的 username 尚未到达时挂一个 20s 检查：到点仍未 secured → 主动重发我方
-	// 公钥触发对方响应并重新挂检查，指数退避 20s→40s→80s（封顶 120s）且**永续**——
-	// 旧实现 3 次后放弃，名单会永久停着一个"同步中"僵尸成员；掉线期间（socket 不开）
-	// 不推进退避计数，重连后从头开始。配合服务器 15s 名单重播保证最终收敛。
-	// When a peer has no username yet, arm a 20s check: on timeout re-send our public
-	// key and re-arm with exponential backoff 20s→40s→80s (capped 120s), forever —
-	// the old code gave up after 3 attempts and left a permanent "syncing" zombie in
-	// the roster. While offline the attempt counter does not advance; backoff restarts
-	// after reconnect. The 15s server roster rebroadcast guarantees convergence.
+	// 某 peer 的 username 尚未到达时挂检查：到点仍未 secured → 主动重发我方
+	// 公钥触发对方响应并重新挂检查，指数退避 3s→6s→12s→24s（封顶 30s）且**永续**——
+	// 旧实现 3 次后放弃会留永久"同步中"僵尸，20s 起步又会被 15s 名单重播饿死。
+	// 掉线期间（socket 不开）不推进退避计数，重连后从头开始。
+	// When a peer has no username yet, arm a check: on timeout re-send our public
+	// key and re-arm with exponential backoff 3s→6s→12s→24s (capped 30s), forever.
+	// The old code gave up after 3 attempts (permanent "syncing" zombie) and a 20s
+	// first delay starved against the 15s roster rebroadcast. While offline the
+	// attempt counter does not advance; backoff restarts after reconnect.
 	armPendingPeerCheck(peerId, attempt = 0) {
 		if (this.pendingPeerTimers[peerId]) {
 			return
 		}
-		const delay = Math.min(this.config.pendingHandshakeTimeout * Math.pow(2, attempt), 120000);
+		const delay = Math.min(3000 * Math.pow(2, attempt), 30000);
 		this.pendingPeerTimers[peerId] = setTimeout(() => {
 			delete this.pendingPeerTimers[peerId];
 			const entry = this.channel[peerId];
