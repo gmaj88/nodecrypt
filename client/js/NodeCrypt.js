@@ -775,7 +775,7 @@ class NodeCrypt {
 		// Same-account new device took over (server close 4000): stop auto-reconnecting
 		// and let the UI ask the user to sign in again. Previously the old device saw
 		// 1005, reconnected in 3s and kicked the new one back — endless dueling.
-		if (event && event.code === 4000) {
+		if (event && Number(event.code) === 4000) {
 			this.terminated = true;
 			this.logEvent('onClose-terminated', event.reason || 'account-taken-over', 'warn');
 			this.stopReconnect();
