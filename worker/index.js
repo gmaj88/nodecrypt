@@ -823,7 +823,13 @@ export class ChatRoom {  constructor(state, env) {
             if (oldConn) {
               this.closeReasons[otherId] = 'uid-replace';
               try {
-                oldConn.close();
+                // 4000 = 应用自定义码「账号已在其他设备登录」：旧设备据此停止自动
+                // 重连并提示重新登录。此前用默认 1005，旧设备 3s 后自动重连又把新
+                // 设备顶掉，同账号两端无限互踢。
+                // 4000 = app-defined "signed in elsewhere": the old device stops
+                // auto-reconnecting. Default 1005 made it reconnect in 3s and kick the
+                // new device back — endless dueling between two sessions of one account.
+                oldConn.close(4000, 'account-taken-over');
               } catch (error) {
                 logEvent('uid-replace-close', [otherId, error], 'error');
               }

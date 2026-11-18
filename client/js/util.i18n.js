@@ -134,6 +134,7 @@ const LANGUAGES = {
 			'voice.direct_incoming': '{name} invited you to a one-on-one call — connecting automatically',
 			'image.too_large': 'Image is too large (over 8MB)',
 			'status.disconnected': 'Node connection closed',
+			'status.session_replaced': 'Account signed in on another device. Please reload and sign in again.',
 					// Help page
 			'help.title': 'User Guide',
 			'help.back_to_login': 'Back to Login',
@@ -305,6 +306,7 @@ const LANGUAGES = {
 			'voice.direct_incoming': '{name} 邀请你进行一对一通话，已自动接入',
 			'image.too_large': '图片过大（超过 8MB）',
 			'status.disconnected': '节点连接已断开',
+			'status.session_replaced': '账号已在其他设备登录，请刷新页面重新登录。',
 			
 			// Help page
 			'help.title': '使用说明',

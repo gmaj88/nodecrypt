@@ -38,6 +38,10 @@ class NodeCrypt {
 		};
 		this.callbacks = {
 			onServerClosed: callbacks.onServerClosed || null,
+			// 会话被同账号新设备接管（服务端 close 4000）：不再自动重连，UI 应提示用户
+			// Session taken over by a same-account device (server close 4000): stop
+			// auto-reconnecting; the UI tells the user to sign in again
+			onSessionReplaced: callbacks.onSessionReplaced || null,
 			onServerSecured: callbacks.onServerSecured || null,
 			onClientSecured: callbacks.onClientSecured || null,
 			onClientList: callbacks.onClientList || null,
@@ -70,6 +74,10 @@ class NodeCrypt {
 		// Our own clientId echoed by the server (l.i); explicit-leave pause flag
 		this.selfId = null;
 		this.paused = false;
+		// 会话已被同账号设备接管：置位后所有自动重连路径永久停止，直到重新登录
+		// Session was taken over by the same account: once set, every auto-reconnect
+		// path stops permanently until the user signs in again
+		this.terminated = false;
 		// 每个尚未完成握手的 peer 的延时检查器（8s 后仍未 secured → onClientPending）
 		// Deferred checkers for peers that never finish the handshake (8s → onClientPending)
 		this.pendingPeerTimers = {};
@@ -194,7 +202,10 @@ class NodeCrypt {
 				channel: channelHash,
 				password: passwordHash,
 				uid: sha256(passwordHash + '|' + channelHash + '|' + String(username))
-			}
+			};
+			// 重新登录 → 解除“已被接管”状态
+			// Fresh sign-in clears the "session replaced" latch
+			this.terminated = false
 		} catch (error) {
 			this.logEvent('setCredentials', error, 'error');
 			return (false)
@@ -206,6 +217,12 @@ class NodeCrypt {
 	// 连接到服务器
 	connect() {
 		if (!this.credentials) {
+			return (false)
+		}
+		// 已被同账号设备接管：任何来源的 connect 都不再发起（重新登录才解除）
+		// Taken over by the same account: refuse every connect trigger until re-login
+		if (this.terminated) {
+			this.logEvent('connect-terminated', null, 'warn');
 			return (false)
 		}
 		this.logEvent('connect', this.config.wsAddress);
@@ -588,6 +605,9 @@ class NodeCrypt {
 					}, this.serverShared))
 				}
 				this.channel[serverDecrypted.c].shared = Buffer.from(this.xorHex(this.channel[serverDecrypted.c].keys.derive(this.clientEc.keyFromPublic(serverDecrypted.p, 'hex').getPublic()).toString('hex').padEnd(64, '8').substr(0, 64), this.credentials.password), 'hex');
+				// 记住本次接受的对端公钥：后续重播同一公钥不再重新协商
+				// Remember the accepted peer key so re-announcements of it stay cheap
+				this.channel[serverDecrypted.c].peerPub = serverDecrypted.p;
 				this.sendMessage(this.encryptServerMessage({
 					a: 'c',
 					n: 0,
@@ -643,7 +663,26 @@ class NodeCrypt {
 				return
 			}
 			if (this.isString(serverDecrypted.p) && /^[0-9a-f]{64}$/.test(serverDecrypted.p)) {
+				// 对方发来了（可能是全新的）公钥。与本端上次接受的一致 → 只是重播，
+				// 用现有 shared 补发 u；不同（对方重启/刷新/换设备 = 新密钥）→ 必须按
+				// 新公钥重新派生 shared 并回送我方公钥，否则对方永远解不开（旧实现只回
+				// 旧 shared 加密的 u，对方"正在加入…"永久卡死）。
+				// The peer sent a (possibly brand-new) public key. Same as the last one we
+				// accepted → just a rebroadcast: reply u with the current shared. Different
+				// (restart/reload/another device = new keypair) → re-derive from the new key
+				// AND send ours back, otherwise the peer can never decrypt (the old code
+				// replied u encrypted with the stale shared → stuck forever).
 				try {
+					if (resendEntry.peerPub !== serverDecrypted.p) {
+						resendEntry.peerPub = serverDecrypted.p;
+						resendEntry.shared = Buffer.from(this.xorHex(resendEntry.keys.derive(this.clientEc.keyFromPublic(serverDecrypted.p, 'hex').getPublic()).toString('hex').padEnd(64, '8').substr(0, 64), this.credentials.password), 'hex');
+						this.sendMessage(this.encryptServerMessage({
+							a: 'c',
+							n: 0,
+							p: resendEntry.keys.getPublic('hex'),
+							c: serverDecrypted.c
+						}, this.serverShared))
+					}
 					this.sendMessage(this.encryptServerMessage({
 						a: 'c',
 						n: 0,
@@ -731,6 +770,28 @@ class NodeCrypt {
 	// WebSocket 关闭事件处理
 	async onClose(event) {
 		this.logEvent('onClose', event);
+		// 同账号新设备接管（服务端 close 4000）：停止自动重连并交给 UI 提示重新登录。
+		// 此前旧设备收到 1005 后 3s 自动重连、再次把新设备顶掉，两侧无限互踢。
+		// Same-account new device took over (server close 4000): stop auto-reconnecting
+		// and let the UI ask the user to sign in again. Previously the old device saw
+		// 1005, reconnected in 3s and kicked the new one back — endless dueling.
+		if (event && event.code === 4000) {
+			this.terminated = true;
+			this.logEvent('onClose-terminated', event.reason || 'account-taken-over', 'warn');
+			this.stopReconnect();
+			this.disconnect();
+			if (this.callbacks.onSessionReplaced) {
+				try {
+					this.callbacks.onSessionReplaced({
+						code: 4000,
+						reason: event.reason || 'account-taken-over'
+					})
+				} catch (error) {
+					this.logEvent('onClose-session-replaced-callback', error, 'error')
+				}
+			}
+			return
+		}
 		// 主动离开期间（paused）不自动重连，等待 resumePresence
 		// No auto-reconnect while intentionally away (paused); wait for resumePresence
 		if (this.paused) {
@@ -775,6 +836,9 @@ class NodeCrypt {
 	// 启动重连定时器
 	startReconnect() {
 		this.stopReconnect();
+		if (this.terminated) {
+			return
+		}
 		this.logEvent('startReconnect');
 		this.reconnect = setTimeout(() => {
 			this.reconnect = null;
@@ -829,6 +893,9 @@ class NodeCrypt {
 	// disconnect. Send bye:why first so the server diag knows which path closed the
 	// socket (plain-text frame, same channel as 'ping', recorded into the close event)
 	forceReconnect(why) {
+		if (this.terminated) {
+			return
+		}
 		this.logEvent('forceReconnect', why, 'warn');
 		try {
 			this.sendMessage('bye:' + why)
@@ -857,7 +924,7 @@ class NodeCrypt {
 		}
 		this.lifecycleArmed = true;
 		const refresh = (why) => {
-			if (!this.credentials) {
+			if (!this.credentials || this.terminated) {
 				return
 			}
 			this.logEvent('lifecycle', why);
@@ -1110,6 +1177,9 @@ class NodeCrypt {
 	// (app foreground / page visible / bfcache restore)
 	resumePresence() {
 		if (!this.paused) {
+			return
+		}
+		if (this.terminated) {
 			return
 		}
 		this.paused = false;

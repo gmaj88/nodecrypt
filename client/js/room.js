@@ -116,14 +116,38 @@ export function joinRoom(userName, roomName, password, modal = null, onResult) {
 	let chatInst = null;
 	const callbacks = {
 		onServerClosed: () => {
-			setStatus(t('status.disconnected', 'Node connection closed'));
-			// Leave voice call on disconnect
+			// 离开语音/隐藏入口 + 让调用方恢复登录按钮（服务端断开由内核自行重连）
+			// Leave voice / hide its entry + restore the sign-in button; the core
+			// reconnects on its own
 			if (window.voiceChat && window.voiceChat.isInCall) {
 				window.voiceChat.leaveCall();
 			}
 			// Hide voice button
 			const voiceBtn = $id('chat-voice-btn');
 			if (voiceBtn) voiceBtn.style.display = 'none';
+			if (onResult && !closed) {
+				closed = true;
+				onResult(false)
+			}
+		},
+		// 同账号新设备接管（服务端 close 4000）：内核已永久停止重连，这里明确提示
+		// 并引导重新登录，避免停留在"正在重连"的假象里
+		// Same-account device took over (server close 4000): the core has permanently
+		// stopped reconnecting; tell the user to sign in again instead of sitting in a
+		// bogus "reconnecting" state
+		onSessionReplaced: () => {
+			if (window.voiceChat && window.voiceChat.isInCall) {
+				window.voiceChat.leaveCall();
+			}
+			const voiceBtn = $id('chat-voice-btn');
+			if (voiceBtn) voiceBtn.style.display = 'none';
+			const notice = t('status.session_replaced', 'Account signed in on another device. Please reload and sign in again.');
+			try {
+				addSystemMsg(notice);
+			} catch (error) { /* ignore */ }
+			try {
+				window.alert(notice)
+			} catch (error) { /* ignore */ }
 			if (onResult && !closed) {
 				closed = true;
 				onResult(false)
