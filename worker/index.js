@@ -701,6 +701,7 @@ export class ChatRoom {  constructor(state, env) {
           a: 'c',
           p: decrypted.p,
           c: clientId
+        };
         // 握手自愈标记透传：k:1 = "我缺少你的公钥，请重发"（客户端协议，见 NodeCrypt）
         // Pass through the handshake-heal flag: k:1 = "I lack your public key, resend"
         if (decrypted.k === 1) {
