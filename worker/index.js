@@ -114,6 +114,18 @@ export class ChatRoom {  constructor(state, env) {
     // Client-reported close reasons (bye:why) and server-side kill tags, merged into
     // the close event detail
     this.closeReasons = {};
+    // 非主动断开的宽限登记：clientId → {channel, uid, closedAt, reason}。
+    // 宽限期内同 uid 重连则接管旧 clientId（名单零变化），期满才真正摘除并广播。
+    // Grace registry for non-explicit disconnects: clientId → {...}. A same-uid
+    // rejoin within the grace takes over the old clientId (roster unchanged);
+    // expiry finally removes and broadcasts.
+    this.pendingLeave = {};
+    // 连接 → 当前 clientId 的动态映射：uid 接管/恢复会把新连接绑到旧 id 上，
+    // 消息与 close 监听必须按当前绑定解析，否则会路由到已删除的临时 id
+    // connection → current clientId map: uid takeover/rebind attaches a new socket
+    // to the old id; message/close listeners must resolve the live binding or they
+    // would route to a deleted provisional id
+    this.connIds = new WeakMap();
 
     this.config = {
       // 180s：客户端心跳在后台标签/省电模式会被节流到分钟级，90s 会把还活着的
@@ -130,6 +142,12 @@ export class ChatRoom {  constructor(state, env) {
       // Min interval between offline pushes per channel: per-frame pushes caused
       // notification storms and stalled the DO serial queue
       notifyThrottle: 60000, // 频道级推送节流 60s：离线期间密集聊天/文件分卷最多 1 条/分钟
+      // 非主动断开的宽限期：网络抖动几秒~十几秒落在宽限期内，名单不广播不闪；
+      // 期满（实际摘除受 15s alarm 粒度影响，最坏 +15s）才广播带 x 的"已离开"
+      // Grace period for non-explicit disconnects: jitter of a few to tens of
+      // seconds stays invisible to rosters; expiry (alarm granularity may add up
+      // to 15s) finally broadcasts the x-marked "left"
+      pendingLeaveGrace: 30000,
       debug: false
     };
 
@@ -392,11 +410,19 @@ export class ChatRoom {  constructor(state, env) {
     connection.addEventListener('message', async (event) => {
       const message = event.data;
 
-      if (!isString(message) || !this.clients[clientId]) {
+      // 动态解析当前绑定：uid 接管/恢复会把新连接挂到旧 clientId 下，
+      // 按临时 id 找条目会扑空导致消息全部丢失
+      // Resolve the live binding: uid takeover/rebind attaches a new socket to the
+      // old clientId; looking up by the provisional id would find nothing and drop
+      // every subsequent message
+      const cid = this.connIds.get(connection) || clientId;
+      const entry = this.clients[cid];
+
+      if (!isString(message) || !entry || entry.connection !== connection) {
         return;
       }
 
-      this.clients[clientId].seen = getTime();
+      entry.seen = getTime();
 
       if (message === 'ping') {
         this.sendMessage(connection, 'pong');
@@ -408,12 +434,12 @@ export class ChatRoom {  constructor(state, env) {
       // bye:lifecycle-probe): the reason is merged into the close event so the diag
       // shows which path closed the socket
       if (message.startsWith('bye:')) {
-        this.closeReasons[clientId] = message.slice(4) || 'client-bye';
-        this.clients[clientId].seen = getTime();
+        this.closeReasons[cid] = message.slice(4) || 'client-bye';
+        entry.seen = getTime();
         return;
       }
-      logEvent('message', [clientId, message.length], 'debug');      // Handle key exchange
-      if (!this.clients[clientId].shared && message.length < 2048) {
+      logEvent('message', [cid, message.length], 'debug');      // Handle key exchange
+      if (!entry.shared && message.length < 2048) {
         try {
           // Generate ECDH key pair using P-384 curve (equivalent to secp384r1)
           const keys = await crypto.subtle.generateKey(
@@ -458,7 +484,7 @@ export class ChatRoom {  constructor(state, env) {
             keys.privateKey,
             384 // P-384 produces 48 bytes (384 bits)
           );          // Take bytes 8-40 (32 bytes) for AES-256 key
-          this.clients[clientId].shared = new Uint8Array(sharedSecretBits).slice(8, 40);
+          entry.shared = new Uint8Array(sharedSecretBits).slice(8, 40);
 
           const response = Array.from(new Uint8Array(publicKeyBuffer))
             .map(b => b.toString(16).padStart(2, '0')).join('') + 
@@ -467,8 +493,8 @@ export class ChatRoom {  constructor(state, env) {
           this.sendMessage(connection, response);
 
         } catch (error) {
-          logEvent('message-key', [clientId, error], 'error');
-          this.closeReasons[clientId] = 'key-error';
+          logEvent('message-key', [cid, error], 'error');
+          this.closeReasons[cid] = 'key-error';
           this.closeConnection(connection);
         }
 
@@ -476,11 +502,11 @@ export class ChatRoom {  constructor(state, env) {
       }
 
       // Handle encrypted messages (serialized per connection — see clientQueues)
-      if (this.clients[clientId].shared && message.length <= (8 * 1024 * 1024)) {
-        const previous = this.clientQueues[clientId] || Promise.resolve();
-        this.clientQueues[clientId] = previous
+      if (entry.shared && message.length <= (8 * 1024 * 1024)) {
+        const previous = this.clientQueues[cid] || Promise.resolve();
+        this.clientQueues[cid] = previous
           .catch(() => {})
-          .then(() => this.processEncryptedMessage(clientId, message));
+          .then(() => this.processEncryptedMessage(cid, message));
       }
     });    // Handle connection close
     connection.addEventListener('close', async (event) => {
@@ -489,16 +515,28 @@ export class ChatRoom {  constructor(state, env) {
       // 服务端主动杀标记）是区分"服务端杀"与"客户端走"的关键
       // Idle-drop forensics: close code / wasClean + reason (client bye report or
       // server-side kill tag) distinguishes server-side kills from client exits
-      const closeReason = this.closeReasons[clientId] || null;
-      delete(this.closeReasons[clientId]);
-      this.noteDiag('closes', [clientId, event ? event.code : null, event ? event.wasClean : null, closeReason]);
+      const cid = this.connIds.get(connection) || clientId;
+      const closeReason = this.closeReasons[cid] || null;
+      delete(this.closeReasons[cid]);
+      this.noteDiag('closes', [cid, event ? event.code : null, event ? event.wasClean : null, closeReason]);
 
-      // 异常断线（没有主动离开信号）：摘除成员并广播不带 x 标记的名单
-      // → 客户端按 45s 延迟判定提示"离开"，期间同名重连则静默取消
-      // Abrupt close (no explicit-leave signal): remove and broadcast without the x
-      // marker → clients apply the 45s delayed judgment; a same-name rejoin cancels it
-      delete(this.clientQueues[clientId]);
-      await this.leaveChannel(clientId, false);
+      // 陈旧连接守卫：uid-replace 接管后旧连接的迟到 close 不得影响新连接
+      // Stale-connection guard: a replaced socket's late close event must not touch
+      // the connection that took over its identity
+      const entry = this.clients[cid];
+      if (!entry || entry.connection !== connection) {
+        return;
+      }
+
+      delete(this.clientQueues[cid]);
+      // 非主动断开进入宽限期：有 uid 挂 pendingLeave（名单不广播不变化），
+      // 无 uid 退化为立即摘除广播；主动退出（q）在 leaveChannel(true) 已摘除，
+      // 此时 channel 为 null，只做条目清理
+      // Non-explicit disconnect enters the grace period: with a uid, register
+      // pendingLeave (roster stays put); without a uid, fall back to immediate
+      // removal+broadcast. Explicit leaves were already handled by
+      // leaveChannel(true) — channel is null here, just clean up the entry
+      await this.markPendingLeave(cid, closeReason || 'abrupt-close');
 
       // cleanupOldConnections 可能已删除该客户端，需要防御缺失
       // cleanupOldConnections may have already deleted this client; guard against it
@@ -509,11 +547,12 @@ export class ChatRoom {  constructor(state, env) {
   }
   // 统一离开出口：摘除成员、广播名单、设备转离线。
   // explicit=true 表示主动离开（WS q / /api/leave）：名单带 x 标记 → 其他端立即提示，并关闭连接；
-  // explicit=false 表示异常断线/清理：不带标记 → 客户端延迟判定。
+  // explicit=false 现在只作为无 uid 旧客户端的兜底（有 uid 的非主动断开走 markPendingLeave 宽限）
   // Unified leave path: remove member, broadcast list, mark device offline.
   // explicit=true = intentional leave (WS q / /api/leave): list carries the x marker so
-  // peers notify instantly, and the connection is closed; explicit=false = abrupt
-  // disconnect/cleanup: no marker, clients apply the delayed judgment.
+  // peers notify instantly, and the connection is closed; explicit=false is now only
+  // the fallback for legacy uid-less clients (uid-carrying abrupt disconnects go
+  // through the markPendingLeave grace path)
   async leaveChannel(clientId, explicit) {
     const clientInfo = this.clients[clientId];
     const channel = clientInfo ? (clientInfo.channel || null) : null;
@@ -553,6 +592,112 @@ export class ChatRoom {  constructor(state, env) {
       } catch (error) {
         logEvent('leave-close', [clientId, error], 'error');
       }
+    }
+  }
+  // 非主动断开：宽限登记。有 uid → 从 clients/clientQueues 删除条目但**保留
+  // channels 成员位**，名单不广播不变化；宽限期内同 uid 重连由 join 接管旧 id
+  // 静默恢复；无 uid → 退化为旧的立即摘除广播。幂等：重复调用（close 事件与
+  // reap 并发）只登记一次。
+  // Non-explicit disconnect: register the grace. With a uid → drop the clients/
+  // clientQueues entries but KEEP the channels slot; the roster is neither
+  // broadcast nor changed; a same-uid rejoin within grace takes over the old id
+  // silently via join. Without a uid → legacy immediate removal+broadcast.
+  // Idempotent: concurrent close-event/reap calls register only once.
+  async markPendingLeave(clientId, reason) {
+    const entry = this.clients[clientId];
+    const channel = entry ? (entry.channel || null) : null;
+    delete(this.clientQueues[clientId]);
+    if (!channel) {
+      // 主动离开（channel 已被 leaveChannel 清空）或从未入频道：只清条目
+      // Explicit leave (channel already cleared) or never joined: entry cleanup only
+      if (entry) {
+        delete this.clients[clientId];
+      }
+      return;
+    }
+    const uid = entry.uid || null;
+    entry.channel = null;
+    // 断开立即转离线：离线推送不因宽限期而延迟
+    // Mark devices offline right away: offline push is not delayed by the grace
+    try {
+      await markDeviceOffline(this.state.storage, channel, clientId);
+    } catch (error) {
+      logEvent('pending-device-offline', [clientId, error], 'error');
+    }
+    if (!uid) {
+      // 无 uid 无法按身份归并重连：保持旧行为（立即摘除并广播，无 x）
+      // Without a uid there is nothing to match a rejoin against: keep the legacy
+      // behavior (immediate removal + broadcast, no x)
+      const members = this.channels[channel];
+      if (members) {
+        const remaining = members.filter((id) => id !== clientId);
+        if (remaining.length === 0) {
+          delete this.channels[channel];
+        } else {
+          this.channels[channel] = remaining;
+        }
+      }
+      delete this.clients[clientId];
+      this.broadcastMemberList(channel);
+      return;
+    }
+    if (this.pendingLeave[clientId]) {
+      // 已登记：保留首次时间，不刷新宽限（参考实现要点）
+      // Already registered: keep the first timestamp, never refresh the grace
+      return;
+    }
+    this.pendingLeave[clientId] = {
+      channel: channel,
+      uid: uid,
+      closedAt: Date.now(),
+      reason: reason || 'close'
+    };
+    delete this.clients[clientId];
+    this.noteDiag('pendingLeave', [clientId, reason || 'close']);
+    // 确保 alarm 在跑：若这是最后一名成员，alarm 不会被取消，宽限到期有人终结名单
+    // Keep the alarm alive: if this was the last client the alarm must not be
+    // canceled, someone still has to finalize the roster when grace expires
+    await this.scheduleCleanupAlarm();
+  }
+  // 宽限期满终结：从 channels 真正摘除，带 x 广播（服务端已等过宽限，
+  // 客户端应立即显示"已离开"）。由 cleanupOldConnections（15s alarm）驱动。
+  // Grace expiry finalizer: actually remove from channels and broadcast with the
+  // x marker (the server already waited out the grace, so clients should show
+  // "left" immediately). Driven by cleanupOldConnections (15s alarm).
+  async finalizePendingLeave() {
+    const now = Date.now();
+    const expired = [];
+    for (const clientId in this.pendingLeave) {
+      if (now - this.pendingLeave[clientId].closedAt >= this.config.pendingLeaveGrace) {
+        expired.push(clientId);
+      }
+    }
+    if (!expired.length) {
+      return;
+    }
+    const leftIdsByChannel = {};
+    for (const clientId of expired) {
+      const rec = this.pendingLeave[clientId];
+      delete this.pendingLeave[clientId];
+      if (this.clients[clientId]) {
+        // 异常防御：条目复活（正常路径接管时已删记录）
+        // Defensive: entry resurrected (the takeover path already deleted the record)
+        continue;
+      }
+      const members = this.channels[rec.channel];
+      if (members) {
+        const remaining = members.filter((id) => id !== clientId);
+        if (remaining.length === 0) {
+          delete this.channels[rec.channel];
+        } else {
+          this.channels[rec.channel] = remaining;
+        }
+        (leftIdsByChannel[rec.channel] = leftIdsByChannel[rec.channel] || []).push(clientId);
+      }
+      this.noteDiag('leaveFinalized', [clientId, Math.round((now - rec.closedAt) / 1000) + 's']);
+    }
+    for (const channel in leftIdsByChannel) {
+      this.broadcastMemberList(channel, leftIdsByChannel[channel]);
     }
   }
   // Process encrypted messages
@@ -615,39 +760,79 @@ export class ChatRoom {  constructor(state, env) {
       // reverse it). Same-name reconnects / multi-device joins no longer leave ghost
       // members; roster size equals the server roster at any moment on all terminals.
       const uid = isString(decrypted.uid) && decrypted.uid.length <= 64 ? decrypted.uid : null;
+
+      // ① 宽限期内同 uid 重连：新连接接管旧 clientId（名单字节级不变、零广播）。
+      // 对端缓存的用户名/密钥继续有效（客户端用户名只在未设置时写入），
+      // 网络抖动几秒~十几秒对其他成员完全不可见
+      // ① Same-uid rejoin within grace: the new connection takes over the old
+      // clientId (roster stays byte-identical, zero broadcasts). Peers' cached
+      // usernames/keys stay valid (client usernames are only written once), so a
+      // few-second network blip is completely invisible to other members
+      let restored = false;
       if (uid) {
-        const replacedIds = [];
+        for (const oldId in this.pendingLeave) {
+          const rec = this.pendingLeave[oldId];
+          if (rec && rec.channel === channel && rec.uid === uid && !this.clients[oldId]) {
+            delete this.pendingLeave[oldId];
+            const provisional = this.clients[clientId];
+            this.clients[oldId] = {
+              connection: provisional.connection,
+              seen: provisional.seen,
+              key: provisional.key,
+              shared: provisional.shared,
+              channel: channel,
+              uid: uid
+            };
+            delete this.clients[clientId];
+            if (this.clientQueues[clientId]) {
+              this.clientQueues[oldId] = this.clientQueues[clientId];
+            }
+            delete this.clientQueues[clientId];
+            this.connIds.set(provisional.connection, oldId);
+            this.noteDiag('pendingRestored', [clientId, oldId]);
+            logEvent('pending-restore', [clientId, oldId], 'info');
+            clientId = oldId;
+            restored = true;
+            break;
+          }
+        }
+      }
+
+      // ② 同 uid 活连接接管（多设备/重复登录）：同样接管旧 id，名单零变化；
+      // 旧 socket 关闭，其迟到 close 由陈旧连接守卫拦下（只记 diag 不动状态）
+      // ② Live same-uid takeover (multi-device / duplicate sign-in): take over the
+      // old id too, roster unchanged; the old socket is closed and its late close
+      // event is intercepted by the stale-connection guard (diag only)
+      if (uid && !restored) {
         for (const otherId in this.clients) {
           const other = this.clients[otherId];
           if (otherId !== clientId && other.uid === uid && other.channel === channel) {
-            replacedIds.push(otherId);
-          }
-        }
-        for (const oldId of replacedIds) {
-          const oldClient = this.clients[oldId];
-          const oldChannel = oldClient ? oldClient.channel : null;
-          // 先同步摘出成员表，旧连接的 close 事件查不到 client 会自然跳过
-          // Splice from the roster first; the stale close handler finds no client and no-ops
-          if (oldChannel && this.channels[oldChannel]) {
-            const remaining = this.channels[oldChannel].filter((id) => id !== oldId);
-            if (remaining.length === 0) {
-              delete this.channels[oldChannel];
-            } else if (remaining.length !== this.channels[oldChannel].length) {
-              this.channels[oldChannel] = remaining;
+            const oldConn = other.connection;
+            const provisional = this.clients[clientId];
+            other.connection = provisional.connection;
+            other.seen = provisional.seen;
+            other.key = provisional.key;
+            other.shared = provisional.shared;
+            delete this.clients[clientId];
+            if (this.clientQueues[clientId]) {
+              this.clientQueues[otherId] = this.clientQueues[clientId];
             }
-          }
-          delete this.clients[oldId];
-          delete this.clientQueues[oldId];
-          if (oldClient && oldClient.connection) {
-            this.closeReasons[oldId] = 'uid-replace';
-            try {
-              oldClient.connection.close();
-            } catch (error) {
-              logEvent('uid-replace-close', [oldId, error], 'error');
+            delete this.clientQueues[clientId];
+            delete this.closeReasons[clientId];
+            this.connIds.set(provisional.connection, otherId);
+            if (oldConn) {
+              this.closeReasons[otherId] = 'uid-replace';
+              try {
+                oldConn.close();
+              } catch (error) {
+                logEvent('uid-replace-close', [otherId, error], 'error');
+              }
             }
+            this.noteDiag('uidReplaced', [clientId, otherId]);
+            logEvent('uid-replace', [clientId, otherId], 'info');
+            clientId = otherId;
+            break;
           }
-          this.noteDiag('uidReplaced', [oldId, clientId]);
-          logEvent('uid-replace', [oldId, clientId], 'info');
         }
       }
 
@@ -831,6 +1016,17 @@ export class ChatRoom {  constructor(state, env) {
             if (entry && entry.uid) {
               uidMap[id] = entry.uid;
               hasUid = true;
+            } else {
+              // 宽限期成员条目已从 clients 删除：从 pendingLeave 登记补 uid，
+              // 新加入者至少能按 uid 归并身份、迁移待投递
+              // Grace-period members have no clients entry: fill the uid from the
+              // pendingLeave registry so newcomers can still merge identities and
+              // retarget pending deliveries
+              const pendingRec = this.pendingLeave[id];
+              if (pendingRec) {
+                uidMap[id] = pendingRec.uid;
+                hasUid = true;
+              }
             }
           }
           if (hasUid) {
@@ -901,9 +1097,12 @@ export class ChatRoom {  constructor(state, env) {
       logEvent('closeConnection', error, 'error');
     }
   }
-  
   // 连接清理方法
   async cleanupOldConnections() {
+    // 先终结宽限期满的成员（带 x 广播），再处理 seen 超时
+    // Finalize grace-expired members (x-marked broadcast) before handling seen timeouts
+    await this.finalizePendingLeave();
+
     const seenThreshold = getTime() - this.config.seenTimeout;
     const clientsToRemove = [];
 
@@ -914,63 +1113,28 @@ export class ChatRoom {  constructor(state, env) {
       }
     }
 
-    // 发生成员变化的频道集合：循环结束后统一补播一次成员表
-    // Channels with membership changes: rebroadcast once after the loop
-    const affectedChannels = new Set();
-
-    // 然后一次性移除所有过期客户端
+    // 然后一次性处理所有过期客户端：转 pendingLeave（名单保持不动），
+    // 关闭死连接；close 事件随后到达时条目已删，只会记 diag 不会重复处理
     for (const clientId of clientsToRemove) {
       try {
         logEvent('connection-seen', clientId, 'debug');
         // 断线取证：reap 携带 seen 空窗秒数，便于区分"节流中的活连接被误杀"
         // Idle-drop forensics: the seen gap tells throttled-but-alive connections apart
         this.noteDiag('reaped', [clientId, Math.round((getTime() - this.clients[clientId].seen) / 1000) + 's']);
-        // close 时 clients 已被删除，这里统一补齐设备离线标记
-        // close event won't find the client anymore, so mark push devices offline here
         const removed = this.clients[clientId];
-        const removedChannel = removed ? removed.channel : null;
-        // 必须先从频道成员表同步摘除：若只删 clients 而不摘 channels，
-        // close 事件回调会查不到 client，该 ID 将永久残留为僵尸成员
-        // Must splice from channels synchronously: the close handler looks up
-        // this.clients[clientId], which is gone by then, so without a splice the
-        // stale ID would linger in channels[] forever as a ghost member
-        if (removedChannel && this.channels[removedChannel]) {
-          const remaining = this.channels[removedChannel].filter((id) => id !== clientId);
-          if (remaining.length === 0) {
-            delete this.channels[removedChannel];
-          } else if (remaining.length !== this.channels[removedChannel].length) {
-            this.channels[removedChannel] = remaining;
-            affectedChannels.add(removedChannel);
-          }
-        }
-        if (removedChannel) {
+        const removedConn = removed ? removed.connection : null;
+        this.closeReasons[clientId] = 'seen-timeout';
+        await this.markPendingLeave(clientId, 'seen-timeout');
+        if (removedConn) {
           try {
-            await markDeviceOffline(this.state.storage, removedChannel, clientId);
-          } catch (error) {
-            logEvent('cleanup-device-offline', [clientId, error], 'error');
-          }
-        }
-        if (removed && removed.connection) {
-          this.closeReasons[clientId] = 'seen-timeout';
-          try {
-            removed.connection.close();
+            removedConn.close();
           } catch (error) {
             logEvent('close-stale-connection', [clientId, error], 'error');
           }
         }
-        delete this.clients[clientId];
-        delete this.clientQueues[clientId];
       } catch (error) {
         logEvent('connection-seen', error, 'error');
       }
-    }
-
-    // 对每个发生成员变化的频道补播成员表 —— 等待中的新成员靠这条恢复握手，
-    // 否则要等下一个 join/close 事件才会再广播
-    // Rebroadcast for each changed channel — pending joiners rely on this to
-    // resume their handshake instead of waiting for the next join/close event
-    for (const channel of affectedChannels) {
-      this.broadcastMemberList(channel);
     }
 
     // 如果没有任何客户端和房间，检查是否需要轮换密钥
@@ -993,7 +1157,12 @@ export class ChatRoom {  constructor(state, env) {
     // single idle pass silently stopped periodic cleanup — ghost members and one-sided
     // "syncing" states then had no fallback to recover from.
     try {
-      if (Object.keys(this.clients).length === 0) {
+      // 取消条件必须包含 pendingLeave：否则最后一名成员掉线时 alarm 被取消，
+      // 宽限记录永远无人终结，幽灵 id 永久残留名单
+      // The cancel condition must include pendingLeave: otherwise when the last
+      // member disconnects the alarm is canceled, grace records are never finalized
+      // and ghost ids linger in rosters forever
+      if (Object.keys(this.clients).length === 0 && Object.keys(this.pendingLeave).length === 0) {
         await this.state.storage.deleteAlarm();
       } else {
         await this.scheduleCleanupAlarm();
