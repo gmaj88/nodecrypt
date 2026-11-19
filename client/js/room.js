@@ -449,7 +449,9 @@ export function handleClientMessage(idx, msg) {
 			// If it's the active room, delegate to util.file.js to handle UI and file transfer state.
 			// This applies to all file-related messages (file_start, file_volume, file_end, etc.)
 			if (window.handleFileMessage) {
-				window.handleFileMessage(msg.data, msgType.includes('_private'));
+				// 透传来源 clientId：接收方取消接收时据此定向回信给发送者
+				// Pass the sender's clientId: receiver-side cancel is routed back to it
+				window.handleFileMessage(msg.data, msgType.includes('_private'), msg.clientId);
 			}
 		} else {
 			// If it's not the active room, only increment unread count for 'file_start' messages.

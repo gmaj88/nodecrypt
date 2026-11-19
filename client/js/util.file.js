@@ -4,11 +4,78 @@ import { deflate, inflate } from 'fflate';
 import { showFileUploadModal } from './util.fileUpload.js';
 
 // 分卷大小统一配置
-const DEFAULT_VOLUME_SIZE = 256 * 1024; // 512KB
+const DEFAULT_VOLUME_SIZE = 256 * 1024; // 256KB
+
+// 单帧体积预算：频道广播帧包含每个目标成员各一份密文，
+// 分卷批量按 目标成员数 × 单卷密文长度 动态收敛，避免大群一次发出数 MB 帧
+// （worker 入站上限 8MB，超限会被静默丢弃；大帧也会拉高转推延迟）
+// Per-frame size budget: a channel frame carries one ciphertext per target member,
+// so the batch size shrinks as the roster grows (worker rejects frames > 8MB)
+const FRAME_BUDGET = 2 * 1024 * 1024;
+const MIN_BATCH = 1;
+const MAX_BATCH = 3;
+// 发送期间短暂掉线（自愈重连通常 3s）不立即中止，等待重连后从当前卷续传
+const RECONNECT_WAIT_MS = 20000;
+// 接收端无任何新卷超过该时长判失败（发送方卡死/掉线/丢卷不再重发）
+const RECEIVE_TIMEOUT_MS = 90000;
+// 文件收发期间推迟看门狗判死（与 APP 端 deferWatchdog 对齐）
+const FILE_WATCHDOG_DEFER_MS = 30000;
 
 // File transfer state management
 // 文件传输状态管理
 window.fileTransfers = new Map();
+
+// 文件收发期间延期心跳看门狗：压缩/加解密占用主线程时 pong 回调会迟到，
+// 旧行为会在传输中途 forceReconnect，导致下一批分卷"未连接"直接中止
+// Defer the heartbeat watchdog during bulk transfers: compression/encryption
+// blocks the main thread, late pongs must not kill a live socket mid-transfer
+function deferFileWatchdog(ms) {
+	const rd = window.roomsData && window.activeRoomIndex >= 0 ? window.roomsData[window.activeRoomIndex] : null;
+	const chat = rd && rd.chat;
+	if (chat && typeof chat.deferWatchdog === 'function') {
+		chat.deferWatchdog(ms || FILE_WATCHDOG_DEFER_MS)
+	}
+}
+
+function activeChat() {
+	const rd = window.roomsData && window.activeRoomIndex >= 0 ? window.roomsData[window.activeRoomIndex] : null;
+	return rd && rd.chat ? rd.chat : null
+}
+
+// 连接可用性：serverShared 未建立（握手未完成）同样视为不可发
+// Connection usable: an unfinished server handshake counts as offline
+function isFileLinkOnline() {
+	const chat = activeChat();
+	return !!(chat && chat.serverShared && typeof chat.isOpen === 'function' && chat.isOpen())
+}
+
+// 目标成员数（私聊恒为 1），用于计算单帧体积
+// Number of targets for one send (1 for private chat), used for frame budgeting
+function fileRosterCount() {
+	const rd = window.roomsData && window.activeRoomIndex >= 0 ? window.roomsData[window.activeRoomIndex] : null;
+	if (rd && rd.privateChatTargetId) return 1;
+	const chat = rd && rd.chat;
+	return chat ? Object.keys(chat.channel || {}).length : 0
+}
+
+function fileTargetCount() {
+	return Math.max(1, fileRosterCount())
+}
+
+// 单卷在"客户端→服务端"帧里的近似字符数：base64 → ChaCha(base64) → AES(base64)
+// 两次 4/3 膨胀，实测约 1.79 倍
+function estimateVolumeFrameChars(volumeData) {
+	return Math.ceil((volumeData || '').length * 1.8)
+}
+
+// 按帧预算计算每批卷数
+function computeBatchSize(volumes, offset) {
+	if (!volumes || !volumes.length) return MIN_BATCH;
+	const perVolume = estimateVolumeFrameChars(volumes[Math.min(offset || 0, volumes.length - 1)]);
+	const targets = fileTargetCount();
+	const fit = Math.floor(FRAME_BUDGET / Math.max(1, perVolume * targets));
+	return Math.max(MIN_BATCH, Math.min(MAX_BATCH, fit || MIN_BATCH))
+}
 
 // Base64 encoding for binary data (more efficient than hex)
 // Base64编码用于二进制数据（比十六进制更高效）
@@ -392,6 +459,10 @@ async function handleFilesUpload(files, onSend) {
 		function updateProgress(message) {
 			// 删除系统提示
 		}
+
+		// 压缩前先续期看门狗：50MB 文件压缩会长期占用主线程，心跳回调迟到
+		// 不能触发自断连接（发送中途掉线的直接原因）
+		deferFileWatchdog(120000);
 		
 		if (files.length === 1) {
 			// Single file upload
@@ -411,13 +482,19 @@ async function handleFilesUpload(files, onSend) {
 				totalVolumes: volumes.length,
 				sentVolumes: 0,
 				status: 'sending',
-				originalHash
+				originalHash,
+				sawRoster: fileRosterCount() > 0,
+				cancelledPeers: new Set()
 			};
 			
 			window.fileTransfers.set(fileId, fileTransfer);
 			
+			// 发送前等待连接就绪（自愈重连窗口内不再直接放弃）
+			await waitForLink(fileTransfer);
+			if (fileTransfer.status === 'failed') return;
+
 			// Send file start message
-			onSend({
+			const startStatus = onSend({
 				type: 'file_start',
 				fileId,
 				fileName: file.name,
@@ -426,6 +503,10 @@ async function handleFilesUpload(files, onSend) {
 				totalVolumes: volumes.length,
 				originalHash
 			});
+			if (startStatus && (startStatus.failed || startStatus.aborted)) {
+				abortBeforeVolumes(fileTransfer, file.name, startStatus);
+				return;
+			}
 			
 			// Send volumes
 			await sendVolumes(fileId, volumes, onSend, updateProgress, file.name);
@@ -451,13 +532,18 @@ async function handleFilesUpload(files, onSend) {
 				archiveHash,
 				fileCount,
 				fileManifest,
-				isArchive: true
+				isArchive: true,
+				sawRoster: fileRosterCount() > 0,
+				cancelledPeers: new Set()
 			};
 			
 			window.fileTransfers.set(fileId, fileTransfer);
 			
+			await waitForLink(fileTransfer);
+			if (fileTransfer.status === 'failed') return;
+
 			// Send archive start message
-			onSend({
+			const startStatus = onSend({
 				type: 'file_start',
 				fileId,
 				fileName: `${files.length} files`,
@@ -469,6 +555,10 @@ async function handleFilesUpload(files, onSend) {
 				fileManifest,
 				isArchive: true
 			});
+			if (startStatus && (startStatus.failed || startStatus.aborted)) {
+				abortBeforeVolumes(fileTransfer, `${files.length} files`, startStatus);
+				return;
+			}
 			
 			// Send volumes
 			await sendVolumes(fileId, volumes, onSend, updateProgress, `${files.length} files`);
@@ -482,6 +572,65 @@ async function handleFilesUpload(files, onSend) {
 	}
 }
 
+// 发送失败原因 → 用户可读文案（配合 core 返回的 reason 码定位问题）
+function fileReasonText(reason) {
+	switch (reason) {
+		case 'offline': return '当前未连接服务器'
+		case 'not-ready': return '有成员尚未就绪'
+		case 'too-large': return '数据帧超过服务端上限'
+		case 'encrypt-failed': return '消息加密失败'
+		case 'send-failed': return '连接已断开'
+		default: return '请稍后重试'
+	}
+}
+
+// 连接未就绪时暂停等待自愈重连（每 400ms 探测，超时判失败）
+function waitForLink(transfer) {
+	return new Promise((resolve) => {
+		const startedAt = Date.now();
+		let notified = false;
+		const tick = () => {
+			if (transfer.status === 'failed') return resolve(false);
+			// 重连后名单晚于握手到达：入房时曾有成员而名单暂空，视为尚未就绪
+			// (otherwise a batch could be dropped into an empty roster)
+			if (fileRosterCount() > 0) transfer.sawRoster = true;
+			const rosterReady = !transfer.sawRoster || fileRosterCount() > 0;
+			if (rosterReady && isFileLinkOnline()) {
+				if (transfer.status === 'paused') {
+					transfer.status = 'sending';
+					updateFileProgress(transfer.fileId);
+				}
+				return resolve(true)
+			}
+			if (Date.now() - startedAt > RECONNECT_WAIT_MS) {
+				transfer.status = 'failed';
+				updateFileProgress(transfer.fileId);
+				if (window.addSystemMsg) {
+					window.addSystemMsg(`文件「${transfer.fileName}」发送已取消：网络中断超过 ${Math.round(RECONNECT_WAIT_MS / 1000)} 秒`)
+				}
+				return resolve(false)
+			}
+			if (!notified) {
+				notified = true;
+				transfer.status = 'paused';
+				updateFileProgress(transfer.fileId)
+			}
+			setTimeout(tick, 400)
+		};
+		tick()
+	})
+}
+
+// 首个控制帧（file_start）都发不出去：卡片置失败并给出具体原因
+function abortBeforeVolumes(transfer, displayName, status) {
+	transfer.status = 'failed';
+	updateFileProgress(transfer.fileId);
+	if (window.addSystemMsg) {
+		window.addSystemMsg(`文件「${displayName}」发送已取消：${fileReasonText(status && status.reason)}`)
+	}
+}
+
+
 // Send volumes with progress tracking
 // 发送分卷并跟踪进度。
 // 背压：onSend 返回 aborted/false 说明有成员未就绪或加密失败 —— 立即中止并提示，
@@ -494,15 +643,16 @@ async function handleFilesUpload(files, onSend) {
 async function sendVolumes(fileId, volumes, onSend, updateProgress, fileName) {
 	const fileTransfer = window.fileTransfers.get(fileId);
 	if (!fileTransfer) return;
+	if (!fileTransfer.cancelledPeers) fileTransfer.cancelledPeers = new Set();
 
 	let currentVolume = 0;
-	const batchSize = 3; // 每批发送3个分卷（与 APP 端一致：约1.6MB/s，避免突发压垮中继/触发逐帧推送）
 	let aborted = false;
 
 	// 中止：标记失败态 + 系统提示（接收方不会再收到后续卷，早停比静默截断诚实）
 	// Abort: mark failed + system notice (receivers get no further volumes; failing
 	// early is more honest than a silent truncation)
 	function abortTransfer(reason) {
+		if (aborted) return;
 		aborted = true;
 		fileTransfer.status = 'failed';
 		updateFileProgress(fileId);
@@ -511,16 +661,40 @@ async function sendVolumes(fileId, volumes, onSend, updateProgress, fileName) {
 		}
 	}
 
-	function sendNextBatch() {
+	// 发送方主动取消入口（当前 UI 未挂按钮，保留给后续/外部调用）
+	fileTransfer.cancelSend = () => abortTransfer('已取消');
+
+	// 接收方取消：跳过该成员继续投递给其他人；所有目标都取消才中止
+	// Peer cancelled: skip that member and keep delivering to the rest; abort only
+	// when every target has cancelled
+	function allPeersCancelled() {
+		const peers = fileTransfer.cancelledPeers;
+		return !!(peers && peers.size > 0 && peers.size >= fileTargetCount())
+	}
+
+	async function sendNextBatch() {
 		if (aborted) return;
+		if (allPeersCancelled()) {
+			abortTransfer('所有接收方已取消接收');
+			return;
+		}
+		// 掉线（自愈重连窗口内）暂停等待，恢复后从当前卷续传
+		if (!(await waitForLink(fileTransfer))) {
+			aborted = true;
+			return;
+		}
+		if (aborted) return;
+
+		const skipIds = Array.from(fileTransfer.cancelledPeers || []);
+		const sendOpts = skipIds.length ? { skip: skipIds } : undefined;
+
 		if (currentVolume >= volumes.length) {
-			// 发送完成消息
-			const completeResult = onSend({
-				type: 'file_complete',
-				fileId
-			});
+			// 发送完成消息（已取消的成员不再投递）
+			const completeResult = onSend({ type: 'file_complete', fileId }, sendOpts);
 			if (!completeResult || completeResult === false || completeResult.aborted) {
-				abortTransfer('有成员尚未就绪，已取消发送');
+				abortTransfer(completeResult && completeResult.reason === 'not-ready'
+					? '有成员尚未就绪，已取消发送'
+					: fileReasonText(completeResult && completeResult.reason));
 				return;
 			}
 
@@ -530,26 +704,27 @@ async function sendVolumes(fileId, volumes, onSend, updateProgress, fileName) {
 			return;
 		}
 
-		// 发送当前批次
-		const batchEnd = Math.min(currentVolume + batchSize, volumes.length);
-		const batch = [];
+		// 大流量期间续期看门狗（加密/发送阻塞导致的心跳迟到不该断链）
+		deferFileWatchdog();
 
+		// 按帧体积预算动态收敛批量（成员越多每批卷数越少）
+		const batchSize = computeBatchSize(volumes, currentVolume);
+		const batchEnd = Math.min(currentVolume + batchSize, volumes.length);
+
+		// 发送批次中的所有分卷；任一卷被拒（未就绪/帧过大/掉线）即中止并给出原因
+		// Send all volumes of the batch; any rejected volume aborts with a reason
 		for (let i = currentVolume; i < batchEnd; i++) {
-			batch.push({
+			const result = onSend({
 				type: 'file_volume',
 				fileId,
 				volumeIndex: i,
 				volumeData: volumes[i],
 				isLast: i === volumes.length - 1
-			});
-		}
-
-		// 发送批次中的所有分卷；任一卷被拒（未就绪/失败）即中止整条传输
-		// Send all volumes of the batch; any rejected volume aborts the transfer
-		for (const volumeMsg of batch) {
-			const result = onSend(volumeMsg);
+			}, sendOpts);
 			if (!result || result === false || result.aborted) {
-				abortTransfer(result && result.missing > 0 ? '有成员尚未就绪，已取消发送' : '发送失败，请稍后重试');
+				abortTransfer(result && result.reason === 'not-ready'
+					? '有成员尚未就绪，已取消发送'
+					: fileReasonText(result && result.reason));
 				return;
 			}
 		}
@@ -579,6 +754,7 @@ function updateFileProgress(fileId) {
 		const progressBar = element.querySelector('.file-progress');
 		const statusText = element.querySelector('.file-status');
 		const downloadBtn = element.querySelector('.file-download-btn');
+		const cancelBtn = element.querySelector('.file-cancel-btn');
 		
 		// 判断是否为发送方（发送方没有volumeData）
 		const isSender = !transfer.volumeData || transfer.volumeData.length === 0;
@@ -595,6 +771,20 @@ function updateFileProgress(fileId) {
 				downloadBtn.classList.remove('show', 'animate-in');
 				downloadBtn.style.display = 'none';
 			}
+		} else if (transfer.status === 'paused') {
+			// 发送端暂停（等待自愈重连）：保留进度，明确提示不是取消
+			const progress = (transfer.sentVolumes / transfer.totalVolumes) * 100;
+			if (progressContainer) {
+				progressContainer.style.display = 'block';
+				progressContainer.classList.remove('fade-out');
+			}
+			if (progressBar) progressBar.style.width = `${progress}%`;
+			if (statusText) statusText.textContent = '网络重连中，已暂停… / Reconnecting, paused';
+			if (downloadBtn) {
+				downloadBtn.classList.remove('show', 'animate-in');
+				downloadBtn.style.display = 'none';
+			}
+			if (cancelBtn) cancelBtn.style.display = 'none';
 		} else if (transfer.status === 'receiving') {
 			const progress = (transfer.receivedVolumes.size / transfer.totalVolumes) * 100;
 			if (progressContainer) {
@@ -647,23 +837,31 @@ function updateFileProgress(fileId) {
 				progressContainer.classList.remove('fade-out');
 			}
 			if (progressBar) progressBar.style.width = '0%';
-			if (statusText) statusText.textContent = isSender ? '发送已取消 / Send cancelled' : '接收中断 / Transfer failed';
+			if (statusText) statusText.textContent = transfer.statusText || (isSender ? '发送已取消 / Send cancelled' : '接收中断 / Transfer failed');
 			if (downloadBtn) {
 				downloadBtn.classList.remove('show', 'animate-in');
 				downloadBtn.style.display = 'none';
 			}
+			if (cancelBtn) cancelBtn.style.display = 'none';
 		}
 	});
 }
 
 // Handle incoming file messages
 // 处理接收到的文件消息
-export function handleFileMessage(message, isPrivate = false) {
-	const { type, fileId, userName } = message;
-	
+// fromClientId：消息来源（room.js 透传），用于文件取消的定向回信
+// fromClientId: the sender's clientId (passed by room.js), used to route cancels
+export function handleFileMessage(message, isPrivate = false, fromClientId = '') {
+	const { type } = message || {};
+
+	if (type === 'file_cancel') {
+		handleFileCancel(message, fromClientId);
+		return;
+	}
+
 	switch (type) {
 		case 'file_start':
-			handleFileStart(message, isPrivate);
+			handleFileStart(message, isPrivate, fromClientId);
 			break;
 		case 'file_volume':
 			handleFileVolume(message);
@@ -674,9 +872,81 @@ export function handleFileMessage(message, isPrivate = false) {
 	}
 }
 
+// 文件取消：接收方取消 → 发送端跳过该成员继续给其他人；
+// 发送端取消 → 接收端释放分卷并置失败（不再永久卡在"接收中"）
+// file_cancel: a receiver opted out (the sender skips that member and continues for
+// the others), or the sender gave up (receivers release volumes and fail cleanly)
+function handleFileCancel(message, fromClientId) {
+	const transfer = message && message.fileId ? window.fileTransfers.get(message.fileId) : null;
+	if (!transfer) return;
+
+	if (transfer.status === 'sending' || transfer.status === 'paused') {
+		// 发送端：登记取消者，后续分卷/完成帧跳过它
+		if (!transfer.cancelledPeers) transfer.cancelledPeers = new Set();
+		if (fromClientId) transfer.cancelledPeers.add(fromClientId);
+		if (window.addSystemMsg) {
+			window.addSystemMsg(`文件「${transfer.fileName}」：有接收方取消了接收，其余成员继续接收`);
+		}
+		return;
+	}
+
+	if (transfer.status !== 'receiving') return;
+
+	transfer.status = 'failed';
+	transfer.statusText = '发送方已取消发送';
+	transfer.volumeData = null;
+	updateFileProgress(transfer.fileId);
+}
+
+// 接收端超时扫描：无任何新卷超过 RECEIVE_TIMEOUT_MS 判失败并释放分卷内存
+// （发送方崩溃/掉线/被取消后不再重发，旧实现会永远停在 Receiving x/y）
+// Receiver sweep: no new volume for RECEIVE_TIMEOUT_MS → fail and release volumes
+let receiveSweepTimer = null;
+function armReceiveSweep() {
+	if (receiveSweepTimer) return;
+	receiveSweepTimer = setInterval(() => {
+		const now = Date.now();
+		let active = 0;
+		for (const [fileId, transfer] of window.fileTransfers) {
+			if (transfer.status !== 'receiving') continue;
+			if (now - (transfer.lastActivityAt || transfer.startedAt || now) > RECEIVE_TIMEOUT_MS) {
+				transfer.status = 'failed';
+				transfer.statusText = '传输超时，请让对方重新发送';
+				transfer.volumeData = null;
+				updateFileProgress(fileId);
+				if (window.addSystemMsg) {
+					window.addSystemMsg(`文件「${transfer.fileName}」接收超时：对方已停止发送，请让其重新发送`);
+				}
+			} else {
+				active += 1;
+			}
+		}
+		if (active === 0) {
+			clearInterval(receiveSweepTimer);
+			receiveSweepTimer = null;
+		}
+	}, 5000);
+}
+
+// 接收方主动放弃接收：本地释放分卷 + 卡片置失败 + 通知发送方跳过自己
+// Receiver-give-up: release volumes locally, fail the card, tell the sender to skip us
+export function cancelFileReceive(fileId) {
+	const transfer = window.fileTransfers.get(fileId);
+	if (!transfer || transfer.status !== 'receiving') return;
+
+	transfer.status = 'failed';
+	transfer.statusText = '已取消接收';
+	transfer.volumeData = null;
+	updateFileProgress(fileId);
+
+	if (transfer.fromClientId && typeof window.ncSendFileCancel === 'function') {
+		window.ncSendFileCancel(transfer.fromClientId, { type: 'file_cancel', fileId });
+	}
+}
+
 // Handle file start message
 // 处理文件开始消息
-function handleFileStart(message, isPrivate) {
+function handleFileStart(message, isPrivate, fromClientId) {
 	const { fileId, fileName, originalSize, compressedSize, totalVolumes, originalHash, archiveHash, fileCount, fileManifest, isArchive, userName } = message;
 	
 	const fileTransfer = {
@@ -693,10 +963,17 @@ function handleFileStart(message, isPrivate) {
 		fileCount,
 		fileManifest,
 		isArchive,
-		userName // 记录发送者名字
+		userName, // 记录发送者名字
+		fromClientId: fromClientId || '',
+		isPrivate: !!isPrivate,
+		startedAt: Date.now(),
+		lastActivityAt: Date.now()
 	};
 	
 	window.fileTransfers.set(fileId, fileTransfer);
+	armReceiveSweep();
+	// 收卷/解压期间主线程繁忙，心跳迟到不能触发自断连接
+	deferFileWatchdog();
 	
 	// 添加文件消息到聊天
 	if (window.addOtherMsg) {
@@ -734,9 +1011,19 @@ function handleFileVolume(message) {
 	const transfer = window.fileTransfers.get(fileId);
 	
 	if (!transfer) return;
+	// 已取消/已超时/已完成：迟到的分卷直接忽略（不再占内存）
+	if (transfer.status !== 'receiving') return;
+	if (!transfer.volumeData) return;
 	
 	transfer.receivedVolumes.add(volumeIndex);
 	transfer.volumeData[volumeIndex] = volumeData;
+	transfer.lastActivityAt = Date.now();
+	deferFileWatchdog();
+	
+	// file_complete 先到（乱序）时，最后一卷补齐即完成
+	if (transfer.completeSeen && transfer.receivedVolumes.size === transfer.totalVolumes) {
+		transfer.status = 'completed';
+	}
 	
 	updateFileProgress(fileId);
 }
@@ -748,6 +1035,11 @@ function handleFileComplete(message) {
 	const transfer = window.fileTransfers.get(fileId);
 	
 	if (!transfer) return;
+	if (transfer.status !== 'receiving') return;
+
+	transfer.completeSeen = true;
+	transfer.lastActivityAt = Date.now();
+	deferFileWatchdog();
 	
 	// 检查是否所有分卷都已接收
 	if (transfer.receivedVolumes.size === transfer.totalVolumes) {

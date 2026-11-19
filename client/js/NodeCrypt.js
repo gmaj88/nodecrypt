@@ -1,4 +1,4 @@
-﻿// NodeCrypt core cryptographic client for secure chat
+// NodeCrypt core cryptographic client for secure chat
 // NodeCrypt 安全聊天的核心加密客户端
 
 import {
@@ -70,6 +70,11 @@ class NodeCrypt {
 		this.lastPingSentAt = 0;
 		this.probeTimer = null;
 		this.connectStartedAt = 0;
+		// 大流量豁免期：文件收发期间主线程被压缩/加解密占用，心跳回调会迟到，
+		// 不能因此判死自断连接（APP 端 deferWatchdog 的镜像实现）
+		// Bulk-transfer hold: while compressing/encrypting the main thread is busy and
+		// heartbeats are late; that must not be treated as a dead link
+		this.transferHoldUntil = 0;
 		// 服务端名单回传的本端 clientId（l.i）；主动离开暂停标志
 		// Our own clientId echoed by the server (l.i); explicit-leave pause flag
 		this.selfId = null;
@@ -102,6 +107,7 @@ class NodeCrypt {
 		this.stopReconnect = this.stopReconnect.bind(this);
 		this.startPing = this.startPing.bind(this);
 		this.stopPing = this.stopPing.bind(this);
+		this.deferWatchdog = this.deferWatchdog.bind(this);
 		this.disconnect = this.disconnect.bind(this);
 		this.sendMessage = this.sendMessage.bind(this);
 		this.sendChannelMessage = this.sendChannelMessage.bind(this);
@@ -864,6 +870,17 @@ class NodeCrypt {
 	// death while the page is visible: background tabs have throttled timers/network so
 	// late pongs do not mean a dead link; background drops are covered by the resume
 	// probe. (The old 25s watchdog was the main source of the periodic 2-3 minute drops.)
+	// 文件传输期间推迟看门狗判死（镜像 APP 端同名方法）：压缩/加解密大分卷时
+	// 主线程与心跳回调都会延后，不推迟会导致发到一半被 forceReconnect 打断，
+	// 下一批分卷直接命中"未连接"被中止（浏览器端发送自动取消的真因）
+	// Defer the watchdog during bulk transfers: compression/encryption blocks the
+	// main thread (and heartbeat callbacks); killing the socket mid-transfer made the
+	// next volume batch fail with "not connected" (root cause of browser auto-cancel)
+	deferWatchdog(ms) {
+		const until = Date.now() + (ms || 30000);
+		this.transferHoldUntil = Math.max(this.transferHoldUntil || 0, until)
+	}
+
 	startPing() {
 		this.stopPing();
 		this.logEvent('startPing');
@@ -875,6 +892,13 @@ class NodeCrypt {
 			if (this.lastPongAt && now - this.lastPongAt > this.config.pongTimeout) {
 				if (typeof document !== 'undefined' && document.visibilityState !== 'visible') {
 					this.logEvent('ping-watchdog', 'no pong but page hidden, skip force-reconnect', 'warn');
+					return
+				}
+				// 文件收发豁免期内不判死（心跳迟到是主线程忙于压缩/加解密的正常现象）
+				// Do not declare death inside a bulk-transfer hold window
+				if (this.transferHoldUntil && now < this.transferHoldUntil) {
+					this.logEvent('ping-watchdog', 'no pong but transfer hold active, skip force-reconnect', 'warn');
+					this.lastPongAt = now;
 					return
 				}
 				this.logEvent('ping-watchdog', 'no pong for ' + (now - this.lastPongAt) + 'ms, forcing reconnect', 'warn');
@@ -1437,6 +1461,11 @@ class NodeCrypt {
 	// Volume frames carry n=0 so a whole file triggers exactly one push (at file_start).
 	sendChannelMessage(type, data, opts) {
 		const rosterIds = Object.keys(this.channel);
+		// opts.skip：本次不投递的成员（接收方取消文件后跳过该成员，其余照常投递）
+		// opts.skip: members excluded from this send (a peer cancelled the file; keep
+		// delivering to everyone else)
+		const skipIds = opts && Array.isArray(opts.skip) ? opts.skip : null;
+		const targetIds = skipIds && skipIds.length ? rosterIds.filter((id) => skipIds.indexOf(id) < 0) : rosterIds;
 		const isVoice = this.isString(type) && type.indexOf('voice-') === 0;
 		const noQueue = !!(opts && opts.noQueue);
 		const nFlag = isVoice || (opts && opts.n === 0) ? 0 : null;
@@ -1446,8 +1475,9 @@ class NodeCrypt {
 					queued: false,
 					failed: !isVoice,
 					aborted: noQueue,
+					reason: 'offline',
 					delivered: 0,
-					total: rosterIds.length
+					total: targetIds.length
 				}
 			}
 			// 掉线：整条排队，重连入房拿到 roster 后自动发出
@@ -1458,13 +1488,13 @@ class NodeCrypt {
 				queued: true,
 				offline: true,
 				delivered: 0,
-				total: rosterIds.length
+				total: targetIds.length
 			}
 		}
 		try {
 			let payloads = {};
 			const missing = [];
-			for (const clientId of rosterIds) {
+			for (const clientId of targetIds) {
 				const entry = this.channel[clientId];
 				if (entry.shared && entry.username) {
 					payloads[clientId] = this.encryptClientMessage({
@@ -1473,7 +1503,15 @@ class NodeCrypt {
 						d: data
 					}, entry.shared);
 					if (payloads[clientId].length === 0) {
-						return (false)
+						this.logEvent('sendChannelMessage', 'encrypt-failed for ' + clientId, 'error');
+						return {
+							queued: false,
+							failed: true,
+							aborted: noQueue,
+							reason: 'encrypt-failed',
+							delivered: 0,
+							total: targetIds.length
+						}
 					}
 				} else {
 					missing.push(clientId)
@@ -1494,7 +1532,15 @@ class NodeCrypt {
 			}
 			const payload = this.encryptServerMessage(wrapper, this.serverShared);
 			if (payload.length === 0 || payload.length > (8 * 1024 * 1024)) {
-				return (false)
+				this.logEvent('sendChannelMessage', 'payload too large or empty: ' + payload.length, 'error');
+				return {
+					queued: false,
+					failed: true,
+					aborted: noQueue,
+					reason: payload.length === 0 ? 'encrypt-failed' : 'too-large',
+					delivered: 0,
+					total: targetIds.length
+				}
 			}
 			this.connection.send(payload);
 			const delivered = Object.keys(payloads).length;
@@ -1506,8 +1552,9 @@ class NodeCrypt {
 					return {
 						queued: false,
 						aborted: true,
+						reason: 'not-ready',
 						delivered: delivered,
-						total: rosterIds.length,
+						total: targetIds.length,
 						missing: missing.length
 					}
 				}
@@ -1519,14 +1566,14 @@ class NodeCrypt {
 					queued: true,
 					offline: false,
 					delivered: delivered,
-					total: rosterIds.length,
+					total: targetIds.length,
 					missing: missing.length
 				}
 			}
 			return {
 				queued: false,
 				delivered: delivered,
-				total: rosterIds.length
+				total: targetIds.length
 			}
 		} catch (error) {
 			this.logEvent('sendChannelMessage', error, 'error');
@@ -1537,14 +1584,15 @@ class NodeCrypt {
 					queued: true,
 					offline: true,
 					delivered: 0,
-					total: rosterIds.length
+					total: targetIds.length
 				}
 			}
 			return {
 				queued: false,
 				failed: true,
+				reason: 'send-failed',
 				delivered: 0,
-				total: rosterIds.length
+				total: targetIds.length
 			}
 		}
 	}
@@ -1562,6 +1610,7 @@ class NodeCrypt {
 					queued: false,
 					failed: true,
 					aborted: true,
+					reason: 'offline',
 					delivered: 0,
 					total: 1
 				}
@@ -1576,6 +1625,7 @@ class NodeCrypt {
 			}
 		}
 		const peerEntry = this.channel[targetCid];
+		let sendError = false;
 		if (peerEntry && peerEntry.shared && peerEntry.username) {
 			try {
 				this.sendMessage(this.encryptServerMessage({
@@ -1593,6 +1643,7 @@ class NodeCrypt {
 					total: 1
 				}
 			} catch (error) {
+				sendError = true;
 				this.logEvent('sendPrivateMessage', error, 'error')
 			}
 		}
@@ -1602,6 +1653,7 @@ class NodeCrypt {
 			return {
 				queued: false,
 				aborted: true,
+				reason: sendError ? 'send-failed' : 'not-ready',
 				delivered: 0,
 				total: 1
 			}

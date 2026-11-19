@@ -427,6 +427,7 @@ function renderFileMessage(fileData, isSender) {
 	let statusText = '';
 	let progressWidth = '0%';
 	let downloadBtnStyle = 'display: none;';
+	let cancelBtnStyle = 'display: none;';
 	let showProgress = false;
 	
 	if (transfer) {
@@ -439,6 +440,14 @@ function renderFileMessage(fileData, isSender) {
 			const progress = (transfer.receivedVolumes.size / transfer.totalVolumes) * 100;
 			progressWidth = `${progress}%`;
 			statusText = `Receiving ${transfer.receivedVolumes.size}/${transfer.totalVolumes}`;
+			showProgress = true;
+			// 接收方可放弃本次接收（本地释放分卷 + 通知发送方跳过自己）
+			// Receiver can opt out (release volumes locally + tell the sender to skip us)
+			if (!isSender) cancelBtnStyle = 'display: inline-flex;';
+		} else if (transfer.status === 'paused') {
+			const progress = (transfer.sentVolumes / transfer.totalVolumes) * 100;
+			progressWidth = `${progress}%`;
+			statusText = 'Reconnecting, paused…';
 			showProgress = true;
 		} else if (transfer.status === 'completed') {
 			// 完成时不显示任何状态，只显示下载按钮
@@ -472,6 +481,7 @@ function renderFileMessage(fileData, isSender) {
 					<div class="file-progress" style="width: ${progressWidth}"></div>
 				</div>
 				<div class="file-status">${statusText}</div>
+				<button class="file-cancel-btn" style="${cancelBtnStyle}" onclick="window.cancelFileReceive('${fileId}')">取消接收</button>
 			</div>` : ''}
 		</div>
 	`;

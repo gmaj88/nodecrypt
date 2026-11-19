@@ -7,7 +7,8 @@ import './NodeCrypt.js';
 import {
 	setupFileSend,
 	handleFileMessage,
-	downloadFile
+	downloadFile,
+	cancelFileReceive
 } from './util.file.js';
 
 // 从 util.image.js 中导入图片处理功能
@@ -129,6 +130,16 @@ window.notifyMessage = notifyMessage;
 window.setupEmojiPicker = setupEmojiPicker;
 window.handleFileMessage = handleFileMessage;
 window.downloadFile = downloadFile;
+window.cancelFileReceive = cancelFileReceive;
+
+// 文件控制帧（当前仅 file_cancel）：定向私聊发给指定成员，避免广播误伤其他接收者
+// File control frame (currently file_cancel): targeted private send so other receivers
+// in the channel keep their transfer
+window.ncSendFileCancel = (targetCid, data) => {
+	const rd = roomsData[activeRoomIndex];
+	if (!rd || !rd.chat || !targetCid) return null;
+	return rd.chat.sendPrivateMessage(targetCid, 'file_cancel_private', data)
+};
 
 // 当 DOM 内容加载完成后执行初始化逻辑
 // Run initialization logic when the DOM content is fully loaded
@@ -381,7 +392,7 @@ window.addEventListener('DOMContentLoaded', () => {
 		inputSelector: '.input-message-input', // 消息输入框选择器 / Message input selector
 		attachBtnSelector: '.chat-attach-btn', // 附件按钮选择器 / Attach button selector
 		fileInputSelector: '.new-message-wrapper input[type="file"]', // 文件输入框选择器 / File input selector
-		onSend: (message) => {
+		onSend: (message, opts) => {
 			const rd = roomsData[activeRoomIndex];
 			if (rd && rd.chat) {
 				const userName = rd.myUserName || '';
@@ -407,7 +418,11 @@ window.addEventListener('DOMContentLoaded', () => {
 					// Volume/complete frames carry n:0 + noQueue: exactly one push per file
 					// (file_start) and no silent queueing that would drop volumes
 					const noQueue = msgWithUser.type === 'file_volume' || msgWithUser.type === 'file_complete';
-					const status = rd.chat.sendChannelMessage(msgWithUser.type, msgWithUser, noQueue ? { n: 0, noQueue: true } : undefined);
+					// opts.skip：已取消接收的成员，后续帧跳过它们继续投递给其他人
+					// opts.skip: peers that cancelled; keep delivering to everyone else
+					const sendOpts = noQueue ? { n: 0, noQueue: true } : {};
+					if (opts && Array.isArray(opts.skip) && opts.skip.length) sendOpts.skip = opts.skip;
+					const status = rd.chat.sendChannelMessage(msgWithUser.type, msgWithUser, (noQueue || sendOpts.skip) ? sendOpts : undefined);
 
 					// 添加到自己的聊天记录
 					if (msgWithUser.type === 'file_start') {
