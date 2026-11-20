@@ -336,8 +336,11 @@ export class VoiceChat {
 		}
 
 		pc.ontrack = (event) => {
-			if (event.streams && event.streams[0]) {
-				this.setupAudioElement(peerId, event.streams[0]);
+			// APP 采集失败->恢复的重协商 SDP 可能缺 a=msid：streams 为空时用 track 兜底建流
+			const stream = (event.streams && event.streams[0])
+				|| (event.track && typeof MediaStream === 'function' ? new MediaStream([event.track]) : null);
+			if (stream) {
+				this.setupAudioElement(peerId, stream);
 			}
 		};
 
