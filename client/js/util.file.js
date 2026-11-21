@@ -47,7 +47,14 @@ function activeChat() {
 // Connection usable: an unfinished server handshake counts as offline
 function isFileLinkOnline() {
 	const chat = activeChat();
-	return !!(chat && chat.serverShared && typeof chat.isOpen === 'function' && chat.isOpen())
+	if (!(chat && chat.serverShared && typeof chat.isOpen === 'function' && chat.isOpen())) return false;
+	// 私聊文件要求目标成员握手完成，否则 file_start 会进 outbox、
+	// 后续分卷却因未就绪直接中止，留下永远收不全的悬挂卡片
+	const rd = roomsData && activeRoomIndex >= 0 ? roomsData[activeRoomIndex] : null;
+	const target = rd && rd.privateChatTargetId;
+	if (!target) return true;
+	const entry = chat.channel && chat.channel[target];
+	return !!(entry && entry.shared && entry.username)
 }
 
 // 目标成员数（私聊恒为 1），用于计算单帧体积
