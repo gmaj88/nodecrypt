@@ -2,6 +2,7 @@
 // 导入必要的模块
 import { deflate, inflate } from 'fflate';
 import { showFileUploadModal } from './util.fileUpload.js';
+import { roomsData, activeRoomIndex } from './room.js';
 
 // 分卷大小统一配置
 const DEFAULT_VOLUME_SIZE = 256 * 1024; // 256KB
@@ -30,7 +31,7 @@ window.fileTransfers = new Map();
 // Defer the heartbeat watchdog during bulk transfers: compression/encryption
 // blocks the main thread, late pongs must not kill a live socket mid-transfer
 function deferFileWatchdog(ms) {
-	const rd = window.roomsData && window.activeRoomIndex >= 0 ? window.roomsData[window.activeRoomIndex] : null;
+	const rd = roomsData && activeRoomIndex >= 0 ? roomsData[activeRoomIndex] : null;
 	const chat = rd && rd.chat;
 	if (chat && typeof chat.deferWatchdog === 'function') {
 		chat.deferWatchdog(ms || FILE_WATCHDOG_DEFER_MS)
@@ -38,7 +39,7 @@ function deferFileWatchdog(ms) {
 }
 
 function activeChat() {
-	const rd = window.roomsData && window.activeRoomIndex >= 0 ? window.roomsData[window.activeRoomIndex] : null;
+	const rd = roomsData && activeRoomIndex >= 0 ? roomsData[activeRoomIndex] : null;
 	return rd && rd.chat ? rd.chat : null
 }
 
@@ -52,7 +53,7 @@ function isFileLinkOnline() {
 // 目标成员数（私聊恒为 1），用于计算单帧体积
 // Number of targets for one send (1 for private chat), used for frame budgeting
 function fileRosterCount() {
-	const rd = window.roomsData && window.activeRoomIndex >= 0 ? window.roomsData[window.activeRoomIndex] : null;
+	const rd = roomsData && activeRoomIndex >= 0 ? roomsData[activeRoomIndex] : null;
 	if (rd && rd.privateChatTargetId) return 1;
 	const chat = rd && rd.chat;
 	return chat ? Object.keys(chat.channel || {}).length : 0
@@ -429,12 +430,12 @@ export function setupFileSend({
 			
 			showFileUploadModal(async (files) => {
 				// 传递 userName 给 onSend
-				const userName = window.roomsData && window.activeRoomIndex >= 0
-					? (window.roomsData[window.activeRoomIndex]?.myUserName || '')
+				const userName = roomsData && activeRoomIndex >= 0
+					? (roomsData[activeRoomIndex]?.myUserName || '')
 					: '';
 				await handleFilesUpload(files, (msg) => {
 					// 合并 userName 字段
-					onSend({ ...msg, userName });
+					return onSend({ ...msg, userName });
 				});
 			});
 		});
