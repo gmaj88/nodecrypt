@@ -1,7 +1,7 @@
 import { generateClientId, encryptMessage, decryptMessage, logEvent, isString, isObject, getTime } from './utils.js';
 import { upsertDevice, markDeviceOffline, notifyOfflineDevices, readNotifyLog, removeDevice, listAllDevices, purgeDevices, debugPush, debugTaskDetail } from './push.js';
 import { getVoiceTurnIceServers } from './voiceTurn.js';
-import { APP_VERSION } from './appVersion.js';
+import { APP_VERSION, APP_ORIGIN } from './appVersion.js';
 
 export default {
   async fetch(request, env, ctx) {
@@ -54,6 +54,7 @@ export default {
     // Must sit before the generic /api/ stub; no-store keeps every cache layer off stale versions
     if (url.pathname === '/api/app-version') {
       return new Response(JSON.stringify({
+        origin: APP_ORIGIN,
         versionCode: APP_VERSION.versionCode,
         versionName: APP_VERSION.versionName,
         url: APP_VERSION.url,

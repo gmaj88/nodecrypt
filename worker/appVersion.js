@@ -5,6 +5,12 @@
 // （镜像由 scripts/fetch-apk.mjs 在 build 时从 mirror.source 下载到 dist/<mirror.path>，
 //  随 Worker 静态资源部署；mirror 字段仅构建用，/api/app-version 不返回。）
 // Release: https://github.com/gmaj88/nodecrypt/releases (tag: app-vX.Y.Z)
+//
+// APP 主站域名（唯一配置处）：通过 /api/app-version 的 origin 字段下发，APP 启动时解析并切换。
+// 换域名只改这里；旧域名建议继续服务一段时间，让旧安装包完成更新/解析切换。
+// Primary origin for the APP (single config point), served as /api/app-version's origin field.
+export const APP_ORIGIN = 'https://ai.aiui.de5.net/';
+
 export const APP_VERSION = {
 	versionCode: 120,
 	versionName: '1.2.0',
